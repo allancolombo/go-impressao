@@ -1,0 +1,9 @@
+{
+  "wsUrl": "ws://localhost:9000/print",
+  "reconnectSeconds": 5,
+  "printerMappings": {
+    "COMANDA": "Nome real da impressora"
+  },
+  "logFile": "log/agent.log",
+  "tmpDir": "tmp"
+}
