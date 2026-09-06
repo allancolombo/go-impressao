@@ -14,11 +14,11 @@ import (
 )
 
 type HistoricoHandler struct {
-	logger     *log.Logger
-	history    *services.HistoryStore
-	jobStore   *services.JobStore
-	formatter  *services.Formatter
-	printSvc   *services.PrintService
+	logger    *log.Logger
+	history   *services.HistoryStore
+	jobStore  *services.JobStore
+	formatter *services.Formatter
+	printSvc  *services.PrintService
 }
 
 func NewHistoricoHandler(logger *log.Logger, history *services.HistoryStore, jobStore *services.JobStore, formatter *services.Formatter, printSvc *services.PrintService) *HistoricoHandler {
@@ -197,17 +197,17 @@ func (h *HistoricoHandler) handleItem(w http.ResponseWriter, r *http.Request) {
 				j.ErrorPublic = err.Error()
 			})
 			writeJSON(w, http.StatusConflict, map[string]any{
-				"ok":    false,
-				"erro":  err.Error(),
+				"ok":     false,
+				"erro":   err.Error(),
 				"job_id": job.ID,
 			})
 			return
 		}
 
 		writeJSON(w, http.StatusAccepted, map[string]any{
-			"ok":         true,
-			"job_id":     job.ID,
-			"status":     job.Status,
+			"ok":          true,
+			"job_id":      job.ID,
+			"status":      job.Status,
 			"preview_url": fmt.Sprintf("/impressao/cozinha/preview/%s", job.ID),
 		})
 		return
@@ -307,7 +307,7 @@ func renderHistoricoHTML() string {
     main { padding: 12px 18px; }
     .card { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    thead th { font-weight: 700; text-align: left; padding: 12px 10px; background: #fafafa; border-bottom: 1px solid var(--line); position: sticky; top: 66px; z-index: 2; }
+    thead th { font-weight: 700; text-align: left; padding: 12px 10px; background: #fafafa; border-bottom: 1px solid var(--line); }
     tbody td { padding: 12px 10px; border-bottom: 1px solid #f1f1f1; vertical-align: middle; }
     tbody tr { cursor: pointer; }
     tbody tr:hover { background: #fbfbfb; }
@@ -326,7 +326,6 @@ func renderHistoricoHTML() string {
     .toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); background: rgba(17,17,17,.96); border: 1px solid rgba(255,255,255,.08); padding: 10px 12px; border-radius: 12px; color: #fff; max-width: 92vw; display:none; }
     @media (max-width: 820px) {
       thead th:nth-child(5), tbody td:nth-child(5) { display:none; }
-      thead th { top: 98px; }
     }
   </style>
 </head>
@@ -620,7 +619,7 @@ func renderHistoricoGlobalHTML() string {
     main { padding: 12px 18px; }
     .card { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    thead th { font-weight: 700; text-align: left; padding: 12px 10px; background: #fafafa; border-bottom: 1px solid var(--line); position: sticky; top: 66px; z-index: 2; }
+    thead th { font-weight: 700; text-align: left; padding: 12px 10px; background: #fafafa; border-bottom: 1px solid var(--line); }
     tbody td { padding: 12px 10px; border-bottom: 1px solid #f1f1f1; vertical-align: middle; }
     tbody tr { cursor: pointer; }
     tbody tr:hover { background: #fbfbfb; }
@@ -639,7 +638,6 @@ func renderHistoricoGlobalHTML() string {
     .toast { position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%); background: rgba(17,17,17,.96); border: 1px solid rgba(255,255,255,.08); padding: 10px 12px; border-radius: 12px; color: #fff; max-width: 92vw; display:none; }
     @media (max-width: 900px) {
       thead th:nth-child(6), tbody td:nth-child(6) { display:none; }
-      thead th { top: 98px; }
     }
   </style>
 </head>

@@ -32,6 +32,18 @@ type ImpressaoHandler struct {
 	conferenciaCooldown   map[string]time.Time
 }
 
+func kitchenCols(cfg *config.Manager, printerName string, modelo string) int {
+	if cfg != nil {
+		return cfg.EffectiveColsByModelo(printerName, modelo)
+	}
+
+	modelo = strings.ToLower(strings.TrimSpace(modelo))
+	if modelo == "56mm" || modelo == "58mm" {
+		return 32
+	}
+	return 48
+}
+
 // NewImpressaoHandler cria o handler HTTP do fluxo de comanda de cozinha.
 func NewImpressaoHandler(logger *log.Logger, jobStore *services.JobStore, formatter *services.Formatter, printer *services.PrintService, history *services.HistoryStore, cfg *config.Manager) *ImpressaoHandler {
 	return &ImpressaoHandler{
@@ -371,10 +383,7 @@ func (h *ImpressaoHandler) handleCriar(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			cols := 48
-			if h.cfg != nil {
-				cols = h.cfg.EffectiveCols(req.Driver)
-			}
+			cols := kitchenCols(h.cfg, req.Driver, req.Modelo)
 			preview := h.formatter.FormatComandaCozinhaWithCols(req, time.Now(), cols)
 			job := h.jobStore.Create(req, preview)
 
@@ -472,10 +481,7 @@ func (h *ImpressaoHandler) handleCriar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cols := 48
-	if h.cfg != nil {
-		cols = h.cfg.EffectiveCols(req.Driver)
-	}
+	cols := kitchenCols(h.cfg, req.Driver, req.Modelo)
 	preview := h.formatter.FormatComandaCozinhaWithCols(req, time.Now(), cols)
 	job := h.jobStore.Create(req, preview)
 

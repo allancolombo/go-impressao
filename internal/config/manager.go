@@ -13,24 +13,27 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 type Manager struct {
 	logger *log.Logger
 	path   string
 
-	mu       sync.RWMutex
-	baseURL  string
-	printers map[string]PrinterConfig
-	logo     LogoConfig
-	empresa  EmpresaParametros
-	hasEmpresa bool
+	mu          sync.RWMutex
+	baseURL     string
+	printers    map[string]PrinterConfig
+	logo        LogoConfig
+	conferencia ConferenciaConfig
+	empresa     EmpresaParametros
+	hasEmpresa  bool
 }
 
 type fileConfig struct {
-	BaseURL  string                  `json:"base_url"`
-	Printers map[string]PrinterConfig `json:"printers,omitempty"`
-	Logo     LogoConfig              `json:"logo,omitempty"`
+	BaseURL     string                   `json:"base_url"`
+	Printers    map[string]PrinterConfig `json:"printers,omitempty"`
+	Logo        LogoConfig               `json:"logo,omitempty"`
+	Conferencia ConferenciaConfig        `json:"conferencia,omitempty"`
 }
 
 func NewManager(logger *log.Logger) *Manager {
@@ -41,22 +44,30 @@ func NewManager(logger *log.Logger) *Manager {
 }
 
 type PrinterMargins struct {
-	TopoMM    int `json:"topo_mm"`
-	BaseMM    int `json:"base_mm"`
+	TopoMM     int `json:"topo_mm"`
+	BaseMM     int `json:"base_mm"`
 	EsquerdaMM int `json:"esquerda_mm"`
 	DireitaMM  int `json:"direita_mm"`
 }
 
 type PrinterConfig struct {
 	Margens PrinterMargins `json:"margens"`
+	Colunas map[string]int `json:"colunas,omitempty"`
 }
 
 type LogoConfig struct {
-	Habilitado   bool   `json:"habilitado"`
-	Arquivo      string `json:"arquivo,omitempty"`
-	LarguraMM    int    `json:"largura_mm"`
-	Alinhamento  string `json:"alinhamento,omitempty"` // left|center|right
-	Transparencia int   `json:"transparencia"`         // 0-100 (100 = sem transparência)
+	Habilitado    bool   `json:"habilitado"`
+	Arquivo       string `json:"arquivo,omitempty"`
+	LarguraMM     int    `json:"largura_mm"`
+	Alinhamento   string `json:"alinhamento,omitempty"` // left|center|right
+	Transparencia int    `json:"transparencia"`         // 0-100 (100 = sem transparência)
+}
+
+type ConferenciaConfig struct {
+	Fonte         string `json:"fonte,omitempty"`
+	Delimitador   string `json:"delimitador,omitempty"`
+	MensagemFinal string `json:"mensagem_final,omitempty"`
+	Vias          int    `json:"vias,omitempty"`
 }
 
 type FlexString string
@@ -80,16 +91,16 @@ func (s *FlexString) UnmarshalJSON(b []byte) error {
 }
 
 type EmpresaParametros struct {
-	Bairro string `json:"bairro"`
-	Cidade string `json:"cidade"`
+	Bairro string     `json:"bairro"`
+	Cidade string     `json:"cidade"`
 	CEP    FlexString `json:"cep"`
-	Estado string `json:"estado"`
-	Rua    string `json:"rua"`
+	Estado string     `json:"estado"`
+	Rua    string     `json:"rua"`
 
-	CNPJ  string `json:"cnpj"`
+	CNPJ  string     `json:"cnpj"`
 	IE    FlexString `json:"ie"`
-	Nome  string `json:"nome"`
-	Razao string `json:"razao"`
+	Nome  string     `json:"nome"`
+	Razao string     `json:"razao"`
 }
 
 func (m *Manager) Init(ctx context.Context) {
@@ -225,10 +236,10 @@ func (m *Manager) tryAdoptLocalLogo() {
 	}
 
 	_ = m.SetLogoConfig(LogoConfig{
-		Habilitado:   true,
-		Arquivo:      fileName,
-		LarguraMM:    60,
-		Alinhamento:  "center",
+		Habilitado:    true,
+		Arquivo:       fileName,
+		LarguraMM:     60,
+		Alinhamento:   "center",
 		Transparencia: 100,
 	})
 	m.logger.Printf("logo: logo.png adotado automaticamente (%s)", candidate)
@@ -289,10 +300,119 @@ func (m *Manager) SetPrinterMargins(printerName string, margins PrinterMargins) 
 	return m.save()
 }
 
+func (m *Manager) ConfiguredColsByModelo(printerName string, modelo string) (int, bool) {
+	printerName = strings.TrimSpace(printerName)
+	modelo = normalizePrinterModelo(modelo)
+	if printerName == "" || modelo == "" {
+		return 0, false
+	}
+
+	pc, ok := m.GetPrinterConfig(printerName)
+	if !ok || pc.Colunas == nil {
+		return 0, false
+	}
+
+	cols, ok := pc.Colunas[modelo]
+	if !ok {
+		return 0, false
+	}
+	if err := ValidatePrinterColumns(modelo, cols); err != nil {
+		return 0, false
+	}
+	return cols, true
+}
+
+func (m *Manager) SetPrinterCols(printerName string, modelo string, cols int) error {
+	printerName = strings.TrimSpace(printerName)
+	if printerName == "" {
+		return errors.New("nome da impressora é obrigatório")
+	}
+	modelo = normalizePrinterModelo(modelo)
+	if modelo == "" {
+		return errors.New(`modelo deve ser "56mm", "58mm" ou "80mm"`)
+	}
+	if err := ValidatePrinterColumns(modelo, cols); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	if m.printers == nil {
+		m.printers = make(map[string]PrinterConfig)
+	}
+	cfg := m.printers[printerName]
+	if cfg.Colunas == nil {
+		cfg.Colunas = make(map[string]int)
+	}
+	cfg.Colunas[modelo] = cols
+	m.printers[printerName] = cfg
+	m.mu.Unlock()
+
+	return m.save()
+}
+
+func (m *Manager) EnsurePrinterCols(printerName string, modelo string, cols int) error {
+	printerName = strings.TrimSpace(printerName)
+	modelo = normalizePrinterModelo(modelo)
+	if printerName == "" || modelo == "" {
+		return nil
+	}
+	if err := ValidatePrinterColumns(modelo, cols); err != nil {
+		return err
+	}
+	if _, ok := m.ConfiguredColsByModelo(printerName, modelo); ok {
+		return nil
+	}
+	return m.SetPrinterCols(printerName, modelo, cols)
+}
+
 func (m *Manager) GetLogo() LogoConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.logo
+}
+
+func DefaultConferenciaConfig() ConferenciaConfig {
+	return ConferenciaConfig{
+		Fonte:       "normal",
+		Delimitador: "-",
+		Vias:        1,
+	}
+}
+
+func normalizeConferenciaConfig(cfg ConferenciaConfig) ConferenciaConfig {
+	cfg.Fonte = strings.ToLower(strings.TrimSpace(cfg.Fonte))
+	cfg.Delimitador = strings.TrimSpace(cfg.Delimitador)
+	cfg.MensagemFinal = strings.TrimSpace(strings.ReplaceAll(cfg.MensagemFinal, "\r\n", "\n"))
+	cfg.MensagemFinal = strings.ReplaceAll(cfg.MensagemFinal, "\r", "\n")
+	if cfg.Fonte == "" {
+		cfg.Fonte = "normal"
+	}
+	if cfg.Delimitador == "" {
+		cfg.Delimitador = "-"
+	}
+	if cfg.Vias <= 0 {
+		cfg.Vias = 1
+	}
+	return cfg
+}
+
+func (m *Manager) GetConferenciaConfig() ConferenciaConfig {
+	m.mu.RLock()
+	cfg := m.conferencia
+	m.mu.RUnlock()
+	return normalizeConferenciaConfig(cfg)
+}
+
+func (m *Manager) SetConferenciaConfig(cfg ConferenciaConfig) error {
+	cfg = normalizeConferenciaConfig(cfg)
+	if err := ValidateConferenciaConfig(cfg); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	m.conferencia = cfg
+	m.mu.Unlock()
+	return m.save()
 }
 
 func (m *Manager) SetLogoConfig(cfg LogoConfig) error {
@@ -350,13 +470,28 @@ func (m *Manager) ConfigDir() string {
 }
 
 func (m *Manager) EffectiveCols(printerName string) int {
-	const maxWidthDots = 576
+	return m.EffectiveColsByModelo(printerName, "80mm")
+}
+
+func (m *Manager) EffectiveColsByModelo(printerName string, modelo string) int {
 	const dotsPerMM = 8
 	const dotsPerCol = 12
 
+	modelo = normalizePrinterModelo(modelo)
+	maxWidthDots := 576
+	maxCols := 48
+	if modelo == "56mm" || modelo == "58mm" {
+		maxWidthDots = 384
+		maxCols = 32
+	}
+
 	printerName = strings.TrimSpace(printerName)
 	if printerName == "" {
-		return 48
+		return maxCols
+	}
+
+	if cols, ok := m.ConfiguredColsByModelo(printerName, modelo); ok {
+		return cols
 	}
 
 	margins := PrinterMargins{}
@@ -366,7 +501,7 @@ func (m *Manager) EffectiveCols(printerName string) int {
 		ok = true
 	}
 	if !ok {
-		return 48
+		return maxCols
 	}
 
 	widthDots := maxWidthDots - (margins.EsquerdaMM+margins.DireitaMM)*dotsPerMM
@@ -378,10 +513,36 @@ func (m *Manager) EffectiveCols(printerName string) int {
 	if cols < 20 {
 		cols = 20
 	}
-	if cols > 48 {
-		cols = 48
+	if cols > maxCols {
+		cols = maxCols
 	}
 	return cols
+}
+
+func normalizePrinterModelo(modelo string) string {
+	modelo = strings.ToLower(strings.TrimSpace(modelo))
+	switch modelo {
+	case "56mm", "58mm", "80mm":
+		return modelo
+	default:
+		return ""
+	}
+}
+
+func ValidatePrinterColumns(modelo string, cols int) error {
+	modelo = normalizePrinterModelo(modelo)
+	if modelo == "" {
+		return errors.New(`modelo deve ser "56mm", "58mm" ou "80mm"`)
+	}
+
+	maxCols := 48
+	if modelo == "56mm" || modelo == "58mm" {
+		maxCols = 32
+	}
+	if cols < 20 || cols > maxCols {
+		return fmt.Errorf("colunas inválidas para %s (use entre 20 e %d)", modelo, maxCols)
+	}
+	return nil
 }
 
 func ValidateMargins(m PrinterMargins) error {
@@ -403,6 +564,27 @@ func ValidateLogo(cfg LogoConfig) error {
 	}
 	if cfg.Transparencia < 0 || cfg.Transparencia > 100 {
 		return errors.New("transparência inválida (0 a 100)")
+	}
+	return nil
+}
+
+func ValidateConferenciaConfig(cfg ConferenciaConfig) error {
+	cfg = normalizeConferenciaConfig(cfg)
+
+	switch cfg.Fonte {
+	case "pequena", "normal", "grande":
+	default:
+		return errors.New(`fonte inválida para conferência (use "pequena", "normal" ou "grande")`)
+	}
+
+	if utf8.RuneCountInString(cfg.Delimitador) > 1 {
+		return errors.New("delimitador da conferência muito grande (use apenas 1 caractere)")
+	}
+	if utf8.RuneCountInString(cfg.MensagemFinal) > 240 {
+		return errors.New("mensagem final da conferência muito grande (use até 240 caracteres)")
+	}
+	if cfg.Vias < 1 {
+		return errors.New("quantidade de vias da conferÃªncia invÃ¡lida (use 1 ou mais)")
 	}
 	return nil
 }
@@ -499,6 +681,7 @@ func (m *Manager) load() error {
 	}
 	m.printers = cfg.Printers
 	m.logo = cfg.Logo
+	m.conferencia = normalizeConferenciaConfig(cfg.Conferencia)
 	if m.logo.Alinhamento == "" {
 		m.logo.Alinhamento = "center"
 	}
@@ -516,7 +699,12 @@ func (m *Manager) save() error {
 	}
 
 	m.mu.RLock()
-	cfg := fileConfig{BaseURL: m.baseURL, Printers: m.printers, Logo: m.logo}
+	cfg := fileConfig{
+		BaseURL:     m.baseURL,
+		Printers:    m.printers,
+		Logo:        m.logo,
+		Conferencia: normalizeConferenciaConfig(m.conferencia),
+	}
 	m.mu.RUnlock()
 
 	b, err := json.MarshalIndent(cfg, "", "  ")

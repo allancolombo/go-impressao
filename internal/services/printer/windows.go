@@ -16,8 +16,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unsafe"
 	"unicode"
+	"unsafe"
 
 	"github.com/goopedir/go-impressao/internal/config"
 	"github.com/goopedir/go-impressao/internal/models"
@@ -32,7 +32,7 @@ import (
 )
 
 type Printer interface {
-	PrintText(ctx context.Context, printerName string, text string) error
+	PrintText(ctx context.Context, printerName string, text string, qrcod string, modelo string) error
 }
 
 // WindowsPrinter implementa impressão no Windows via PowerShell (Get-Printer / Out-Printer).
@@ -48,11 +48,47 @@ func NewWindowsPrinter(logger *log.Logger, cfg *config.Manager) *WindowsPrinter 
 	return &WindowsPrinter{logger: logger, cfg: cfg}
 }
 
-func (p *WindowsPrinter) PrintText(ctx context.Context, printerName string, text string) error {
+func (p *WindowsPrinter) resolvePrinterName(ctx context.Context, printerName string) (string, error) {
 	printerName = strings.TrimSpace(printerName)
-
 	if printerName == "" {
-		return errors.New("nome da impressora não informado")
+		return "", errors.New("nome da impressora não informado")
+	}
+	if strings.EqualFold(printerName, "default") {
+		name, err := p.getDefaultPrinterName(ctx)
+		if err != nil {
+			return "", err
+		}
+		return name, nil
+	}
+	return printerName, nil
+}
+
+func (p *WindowsPrinter) getDefaultPrinterName(ctx context.Context) (string, error) {
+	script := "$p = Get-CimInstance -ClassName Win32_Printer | Where-Object { $_.Default -eq $true } | Select-Object -First 1 -ExpandProperty Name; " +
+		"if ($null -eq $p -or [string]::IsNullOrWhiteSpace($p)) { Write-Output '__NOT_FOUND__'; exit 0 }; " +
+		"Write-Output $p"
+	out, err := runPowerShell(ctx, script)
+	if err != nil {
+		return "", fmt.Errorf("erro ao consultar impressora padrão do Windows: %w", err)
+	}
+	name := strings.TrimSpace(strings.ReplaceAll(strings.TrimSpace(out), "\r\n", "\n"))
+	if strings.Contains(name, "\n") {
+		parts := strings.Split(name, "\n")
+		if len(parts) > 0 {
+			name = strings.TrimSpace(parts[0])
+		}
+	}
+	if name == "" || name == "__NOT_FOUND__" {
+		return "", errors.New("nenhuma impressora padrão definida no Windows")
+	}
+	return name, nil
+}
+
+func (p *WindowsPrinter) PrintText(ctx context.Context, printerName string, text string, qrcod string, modelo string) error {
+	var err error
+	printerName, err = p.resolvePrinterName(ctx, printerName)
+	if err != nil {
+		return err
 	}
 
 	_, workOffline, err := p.getPrinterInfo(ctx, printerName)
@@ -72,13 +108,19 @@ func (p *WindowsPrinter) PrintText(ctx context.Context, printerName string, text
 		}
 	}
 
-	payload := buildEscPOS80mm(text, hasMargins, margins, config.LogoConfig{}, nil)
+	maxWidthDots := 576
+	modelo = strings.ToLower(strings.TrimSpace(modelo))
+	if modelo == "56mm" || modelo == "58mm" {
+		maxWidthDots = 384
+	}
+
+	payload := buildEscPOSText(text, qrcod, hasMargins, margins, config.LogoConfig{}, nil, maxWidthDots)
 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	p.logger.Printf("impressão: enviando para impressora_windows=%q modo=raw_escpos bytes=%d", printerName, len(payload))
+	p.logger.Printf("impressão: enviando para impressora_windows=%q modelo=%q modo=raw_escpos bytes=%d", printerName, modelo, len(payload))
 	if err := printRAW(printerName, payload); err == nil {
 		return nil
 	}
@@ -109,9 +151,10 @@ func (p *WindowsPrinter) PrintText(ctx context.Context, printerName string, text
 }
 
 func (p *WindowsPrinter) PrintTest(ctx context.Context, printerName string) error {
-	printerName = strings.TrimSpace(printerName)
-	if printerName == "" {
-		return errors.New("nome da impressora não informado")
+	var err error
+	printerName, err = p.resolvePrinterName(ctx, printerName)
+	if err != nil {
+		return err
 	}
 
 	_, workOffline, err := p.getPrinterInfo(ctx, printerName)
@@ -170,10 +213,11 @@ func (p *WindowsPrinter) PrintTest(ctx context.Context, printerName string) erro
 }
 
 func (p *WindowsPrinter) PrintConferencia(ctx context.Context, req models.ConferenciaRequest) error {
-	printerName := strings.TrimSpace(req.Driver)
-	if printerName == "" {
-		return errors.New("nome da impressora não informado")
+	printerName, err := p.resolvePrinterName(ctx, req.Driver)
+	if err != nil {
+		return err
 	}
+	req.Driver = printerName
 	if p.cfg == nil {
 		return errors.New("configuração não disponível para carregar parâmetros")
 	}
@@ -212,12 +256,15 @@ func (p *WindowsPrinter) PrintConferencia(ctx context.Context, req models.Confer
 	}
 
 	printedAt := time.Now()
-	fallbackCols := maxCols - 6
-	if fallbackCols < 20 {
-		fallbackCols = 20
+	cols := p.conferenciaConfiguredCols(printerName, req.Modelo, maxWidthDots, maxCols)
+	conferenciaCfg := config.DefaultConferenciaConfig()
+	if p.cfg != nil {
+		conferenciaCfg = p.cfg.GetConferenciaConfig()
 	}
-	textFallback := buildFallbackConferenciaText(req, empresaCfg, printedAt, fallbackCols)
-	payload := buildEscPOSConferencia(req, empresaCfg, printedAt, hasMargins, margins, maxWidthDots, maxCols)
+	textFallback := buildFallbackConferenciaText(req, empresaCfg, printedAt, cols, conferenciaCfg)
+	payload := buildEscPOSConferencia(req, empresaCfg, printedAt, hasMargins, margins, maxWidthDots, maxCols, cols, conferenciaCfg)
+	textFallback = duplicateConferenciaText(textFallback, conferenciaCfg.Vias)
+	payload = duplicateConferenciaPayload(payload, conferenciaCfg.Vias)
 
 	if err := ctx.Err(); err != nil {
 		return err
@@ -253,11 +300,54 @@ func (p *WindowsPrinter) PrintConferencia(ctx context.Context, req models.Confer
 	return nil
 }
 
-func (p *WindowsPrinter) PrintSangria(ctx context.Context, req models.SangriaRequest) error {
-	printerName := strings.TrimSpace(req.Driver)
-	if printerName == "" {
-		return errors.New("nome da impressora não informado")
+func duplicateConferenciaPayload(payload []byte, vias int) []byte {
+	if vias <= 1 || len(payload) == 0 {
+		return payload
 	}
+	return bytes.Repeat(payload, vias)
+}
+
+func duplicateConferenciaText(text string, vias int) string {
+	if vias <= 1 || text == "" {
+		return text
+	}
+	return strings.Repeat(text, vias)
+}
+
+func conferenciaCols(maxWidthDots int, maxCols int) int {
+	const dotsPerCol = 12
+	leftDots := 8
+	widthDots := maxWidthDots - leftDots
+	cols := widthDots / dotsPerCol
+	if cols < 20 {
+		cols = 20
+	}
+	if cols > maxCols {
+		cols = maxCols
+	}
+	return cols
+}
+
+func (p *WindowsPrinter) conferenciaConfiguredCols(printerName string, modelo string, maxWidthDots int, maxCols int) int {
+	cols := conferenciaCols(maxWidthDots, maxCols)
+	if p == nil || p.cfg == nil {
+		return cols
+	}
+	if err := p.cfg.EnsurePrinterCols(printerName, modelo, cols); err != nil && p.logger != nil {
+		p.logger.Printf("config: falha ao registrar colunas padrão da conferência para impressora=%q modelo=%q: %v", printerName, modelo, err)
+	}
+	if configured, ok := p.cfg.ConfiguredColsByModelo(printerName, modelo); ok {
+		return configured
+	}
+	return cols
+}
+
+func (p *WindowsPrinter) PrintSangria(ctx context.Context, req models.SangriaRequest) error {
+	printerName, err := p.resolvePrinterName(ctx, req.Driver)
+	if err != nil {
+		return err
+	}
+	req.Driver = printerName
 	if p.cfg == nil {
 		return errors.New("configuração não disponível para carregar parâmetros")
 	}
@@ -296,10 +386,7 @@ func (p *WindowsPrinter) PrintSangria(ctx context.Context, req models.SangriaReq
 	}
 
 	printedAt := time.Now()
-	fallbackCols := maxCols - 6
-	if fallbackCols < 20 {
-		fallbackCols = 20
-	}
+	fallbackCols := reportFallbackCols(req.Modelo, maxCols)
 	textFallback := buildFallbackSangriaText(req, empresaCfg, printedAt, fallbackCols)
 	payload := buildEscPOSSangria(req, empresaCfg, printedAt, hasMargins, margins, maxWidthDots, maxCols)
 
@@ -338,10 +425,11 @@ func (p *WindowsPrinter) PrintSangria(ctx context.Context, req models.SangriaReq
 }
 
 func (p *WindowsPrinter) PrintCaixaFechamento(ctx context.Context, req models.CaixaFechamentoRequest) error {
-	printerName := strings.TrimSpace(req.Driver)
-	if printerName == "" {
-		return errors.New("nome da impressora não informado")
+	printerName, err := p.resolvePrinterName(ctx, req.Driver)
+	if err != nil {
+		return err
 	}
+	req.Driver = printerName
 	if p.cfg == nil {
 		return errors.New("configuração não disponível para carregar parâmetros")
 	}
@@ -380,10 +468,7 @@ func (p *WindowsPrinter) PrintCaixaFechamento(ctx context.Context, req models.Ca
 	}
 
 	printedAt := time.Now()
-	fallbackCols := maxCols - 6
-	if fallbackCols < 20 {
-		fallbackCols = 20
-	}
+	fallbackCols := reportFallbackCols(req.Modelo, maxCols)
 	textFallback := buildFallbackCaixaFechamentoText(req, empresaCfg, printedAt, fallbackCols)
 	payload := buildEscPOSCaixaFechamento(req, empresaCfg, printedAt, hasMargins, margins, maxWidthDots, maxCols)
 
@@ -477,11 +562,15 @@ func DefaultPrintContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 30*time.Second)
 }
 
-func buildEscPOS80mm(text string, hasMargins bool, margins config.PrinterMargins, logo config.LogoConfig, logoBytes []byte) []byte {
+func buildEscPOSText(text string, qrcod string, hasMargins bool, margins config.PrinterMargins, logo config.LogoConfig, logoBytes []byte, maxWidthDots int) []byte {
 	text = strings.ReplaceAll(text, "\r\n", "\n")
 	if !strings.HasSuffix(text, "\n") {
 		text += "\n"
 	}
+	qrcod = sanitizeOneLineASCII(qrcod)
+	qrcod = strings.ReplaceAll(qrcod, "\n", " ")
+	qrcod = strings.ReplaceAll(qrcod, "\r", " ")
+	qrcod = strings.TrimSpace(qrcod)
 
 	headerLine, rest, ok := strings.Cut(text, "\n")
 	header := strings.TrimSpace(headerLine)
@@ -490,7 +579,6 @@ func buildEscPOS80mm(text string, hasMargins bool, margins config.PrinterMargins
 	}
 
 	const dotsPerMM = 8
-	const maxWidthDots = 576
 	const dotsPerCol = 12
 
 	buf := make([]byte, 0, len(text)+96)
@@ -527,6 +615,13 @@ func buildEscPOS80mm(text string, hasMargins bool, margins config.PrinterMargins
 		buf = append(buf, 0x1B, 0x61, 0x00)
 	}
 
+	if strings.TrimSpace(qrcod) != "" {
+		buf = append(buf, 0x1B, 0x61, 0x01)
+		appendEscPOSQRCode(&buf, qrcod, 6)
+		buf = append(buf, '\n')
+		buf = append(buf, 0x1B, 0x61, 0x00)
+	}
+
 	cols := widthDots / dotsPerCol
 	if cols < 20 {
 		cols = 20
@@ -552,6 +647,34 @@ func buildEscPOS80mm(text string, hasMargins bool, margins config.PrinterMargins
 	}
 	buf = append(buf, 0x1D, 0x56, 0x42, 0x00)
 	return buf
+}
+
+func appendEscPOSQRCode(buf *[]byte, data string, moduleSize byte) {
+	d := strings.TrimSpace(data)
+	if d == "" {
+		return
+	}
+	if len(d) > 800 {
+		d = d[:800]
+	}
+	if moduleSize < 1 {
+		moduleSize = 1
+	}
+	if moduleSize > 16 {
+		moduleSize = 16
+	}
+
+	*buf = append(*buf, 0x1D, 0x28, 0x6B, 0x04, 0x00, 0x31, 0x41, 0x32, 0x00)
+	*buf = append(*buf, 0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x43, moduleSize)
+	*buf = append(*buf, 0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x45, 0x31)
+
+	payloadLen := len(d) + 3
+	pL := byte(payloadLen % 256)
+	pH := byte(payloadLen / 256)
+	*buf = append(*buf, 0x1D, 0x28, 0x6B, pL, pH, 0x31, 0x50, 0x30)
+	*buf = append(*buf, []byte(d)...)
+
+	*buf = append(*buf, 0x1D, 0x28, 0x6B, 0x03, 0x00, 0x31, 0x51, 0x30)
 }
 
 func padCenter(s string, cols int) string {
@@ -721,41 +844,226 @@ func escposQRCode(data string, size int) []byte {
 	return b
 }
 
-func buildFallbackConferenciaText(req models.ConferenciaRequest, empresaCfg config.EmpresaParametros, printedAt time.Time, cols int) string {
-	if isComandaConferencia(req) {
-		return buildFallbackConferenciaComanda(req, empresaCfg, printedAt, cols)
+func empresaHeaderLines(empresaCfg config.EmpresaParametros) []string {
+	lines := make([]string, 0, 5)
+
+	primeiraLinha := sanitizeOneLineASCII(empresaCfg.Nome)
+	segundaLinha := sanitizeOneLineASCII(empresaCfg.Razao)
+	if primeiraLinha == "" {
+		primeiraLinha = segundaLinha
+		segundaLinha = ""
+	}
+	if primeiraLinha != "" {
+		lines = append(lines, primeiraLinha)
+	}
+	if segundaLinha != "" && !strings.EqualFold(primeiraLinha, segundaLinha) {
+		lines = append(lines, segundaLinha)
 	}
 
-	empresa := sanitizeOneLineASCII(empresaCfg.Nome)
-	if empresa == "" {
-		empresa = sanitizeOneLineASCII(empresaCfg.Razao)
+	if cnpj := sanitizeOneLineASCII(empresaCfg.CNPJ); cnpj != "" {
+		lines = append(lines, "CNPJ: "+cnpj)
 	}
-	cnpj := "CNPJ: " + sanitizeOneLineASCII(empresaCfg.CNPJ)
-	fantasia := sanitizeOneLineASCII(empresaCfg.Razao)
-	endereco := sanitizeOneLineASCII(fmt.Sprintf("%s, %s, %s/%s - CEP %s", empresaCfg.Rua, empresaCfg.Bairro, empresaCfg.Cidade, empresaCfg.Estado, empresaCfg.CEP))
-	ie := "IE: " + sanitizeOneLineASCII(string(empresaCfg.IE))
+	if endereco := empresaEnderecoLine(empresaCfg); endereco != "" {
+		lines = append(lines, endereco)
+	}
+	if ie := sanitizeOneLineASCII(string(empresaCfg.IE)); ie != "" {
+		lines = append(lines, "IE: "+ie)
+	}
+
+	return lines
+}
+
+func empresaEnderecoLine(empresaCfg config.EmpresaParametros) string {
+	parts := make([]string, 0, 4)
+	if rua := sanitizeOneLineASCII(empresaCfg.Rua); rua != "" {
+		parts = append(parts, rua)
+	}
+	if bairro := sanitizeOneLineASCII(empresaCfg.Bairro); bairro != "" {
+		parts = append(parts, bairro)
+	}
+
+	cidade := sanitizeOneLineASCII(empresaCfg.Cidade)
+	estado := sanitizeOneLineASCII(empresaCfg.Estado)
+	switch {
+	case cidade != "" && estado != "":
+		parts = append(parts, cidade+"/"+estado)
+	case cidade != "":
+		parts = append(parts, cidade)
+	case estado != "":
+		parts = append(parts, estado)
+	}
+
+	endereco := strings.Join(parts, ", ")
+	if cep := sanitizeOneLineASCII(string(empresaCfg.CEP)); cep != "" {
+		if endereco != "" {
+			endereco += " - "
+		}
+		endereco += "CEP " + cep
+	}
+
+	return sanitizeOneLineASCII(endereco)
+}
+
+type conferenciaFontStyle struct {
+	font byte
+	size byte
+}
+
+func conferenciaFont(cfg config.ConferenciaConfig) conferenciaFontStyle {
+	switch strings.ToLower(strings.TrimSpace(cfg.Fonte)) {
+	case "pequena":
+		return conferenciaFontStyle{font: 0x01, size: 0x00}
+	case "grande":
+		return conferenciaFontStyle{font: 0x00, size: 0x01}
+	default:
+		return conferenciaFontStyle{font: 0x00, size: 0x00}
+	}
+}
+
+func appendConferenciaFont(buf *[]byte, style conferenciaFontStyle) {
+	*buf = append(*buf, 0x1B, 0x4D, style.font)
+	*buf = append(*buf, 0x1D, 0x21, style.size)
+}
+
+func repeatPattern(pattern string, size int) string {
+	if size <= 0 {
+		return ""
+	}
+	pattern = sanitizeOneLineASCII(pattern)
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		pattern = "-"
+	}
+	var b strings.Builder
+	for b.Len() < size {
+		b.WriteString(pattern)
+	}
+	out := b.String()
+	if len(out) > size {
+		out = out[:size]
+	}
+	return out
+}
+
+func conferenciaDelimiterLine(cfg config.ConferenciaConfig, cols int) string {
+	return repeatPattern(cfg.Delimitador, cols)
+}
+
+func conferenciaMoneyLine(left string, right string, cols int, cfg config.ConferenciaConfig) string {
+	return conferenciaMoneyLineWithFill(left, right, cols, cfg, true)
+}
+
+func conferenciaMoneyLineWithFill(left string, right string, cols int, cfg config.ConferenciaConfig, useDelimiter bool) string {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	if cols <= 0 {
+		return left + " " + right
+	}
+	if right == "" {
+		return leftRightASCII(left, right, cols)
+	}
+	if left == "" {
+		fill := strings.Repeat(" ", cols-len(right)-1)
+		if useDelimiter {
+			fill = repeatPattern(cfg.Delimitador, cols-len(right)-1)
+			if fill == "" {
+				fill = " "
+			}
+		}
+		return fill + " " + right
+	}
+	space := cols - len(left) - len(right)
+	if space < 1 {
+		return leftRightASCII(left, right, cols)
+	}
+	fill := strings.Repeat(" ", space)
+	if useDelimiter {
+		fill = repeatPattern(cfg.Delimitador, space)
+		if fill == "" {
+			fill = strings.Repeat(" ", space)
+		}
+	}
+	return left + fill + right
+}
+
+func shouldUseDelimiterInProdutoValue(current models.Produto, next *models.Produto) bool {
+	if next == nil {
+		return false
+	}
+	currentCat := strings.ToUpper(strings.TrimSpace(sanitizeTextASCII(current.Categoria)))
+	nextCat := strings.ToUpper(strings.TrimSpace(sanitizeTextASCII(next.Categoria)))
+	return currentCat != "" && currentCat == nextCat
+}
+
+func conferenciaCategoryLine(cat string, cols int, cfg config.ConferenciaConfig) string {
+	cat = strings.TrimSpace(cat)
+	if cat == "" || cols <= 0 {
+		return cat
+	}
+	core := " " + cat + " "
+	if len(core) >= cols {
+		return core[:cols]
+	}
+	fill := cols - len(core)
+	left := fill / 2
+	right := fill - left
+	return repeatPattern(cfg.Delimitador, left) + core + repeatPattern(cfg.Delimitador, right)
+}
+
+func appendConferenciaMensagem(buf *[]byte, cfg config.ConferenciaConfig, cols int) {
+	msg := sanitizeTextASCII(cfg.MensagemFinal)
+	if strings.TrimSpace(msg) == "" {
+		return
+	}
+	*buf = append(*buf, '\n')
+	*buf = append(*buf, 0x1B, 0x61, 0x01)
+	for _, block := range strings.Split(msg, "\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			*buf = append(*buf, '\n')
+			continue
+		}
+		for _, line := range wrapTextASCII(block, cols) {
+			*buf = append(*buf, encodeCP850(centerASCII(line, cols))...)
+			*buf = append(*buf, '\n')
+		}
+	}
+	*buf = append(*buf, 0x1B, 0x61, 0x00)
+}
+
+func appendFallbackConferenciaMensagem(b *strings.Builder, cfg config.ConferenciaConfig, cols int) {
+	msg := sanitizeTextASCII(cfg.MensagemFinal)
+	if strings.TrimSpace(msg) == "" {
+		return
+	}
+	b.WriteString("\n")
+	for _, block := range strings.Split(msg, "\n") {
+		block = strings.TrimSpace(block)
+		if block == "" {
+			b.WriteString("\n")
+			continue
+		}
+		for _, line := range wrapTextASCII(block, cols) {
+			b.WriteString(centerASCII(line, cols))
+			b.WriteString("\n")
+		}
+	}
+}
+
+func buildFallbackConferenciaText(req models.ConferenciaRequest, empresaCfg config.EmpresaParametros, printedAt time.Time, cols int, conferenciaCfg config.ConferenciaConfig) string {
+	if isComandaConferencia(req) {
+		return buildFallbackConferenciaComanda(req, empresaCfg, printedAt, cols, conferenciaCfg)
+	}
+
+	headerLines := empresaHeaderLines(empresaCfg)
 	mesa := strings.ToUpper(sanitizeOneLineASCII(req.Mesa))
 
 	var b strings.Builder
-	for _, l := range wrapTextASCII(empresa, cols) {
-		b.WriteString(l)
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(cnpj, cols) {
-		b.WriteString(l)
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(fantasia, cols) {
-		b.WriteString(l)
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(endereco, cols) {
-		b.WriteString(l)
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(ie, cols) {
-		b.WriteString(l)
-		b.WriteString("\n")
+	for _, line := range headerLines {
+		for _, l := range wrapTextASCII(line, cols) {
+			b.WriteString(l)
+			b.WriteString("\n")
+		}
 	}
 	b.WriteString("\n")
 	b.WriteString(mesa)
@@ -774,14 +1082,18 @@ func buildFallbackConferenciaText(req models.ConferenciaRequest, empresaCfg conf
 	all = groupConferenciaProdutos(all)
 
 	lastProdCat := ""
-	for _, p := range all {
+	for i, p := range all {
 		prodCat := strings.ToUpper(strings.TrimSpace(sanitizeTextASCII(p.Categoria)))
 		if prodCat != "" && prodCat != lastProdCat {
-			b.WriteString(dottedCategoryLine(prodCat, cols))
+			b.WriteString(conferenciaCategoryLine(prodCat, cols, conferenciaCfg))
 			b.WriteString("\n")
 			lastProdCat = prodCat
 		}
-		writeFallbackProduto(&b, p, cols)
+		var next *models.Produto
+		if i+1 < len(all) {
+			next = &all[i+1]
+		}
+		writeFallbackProduto(&b, p, cols, conferenciaCfg, shouldUseDelimiterInProdutoValue(p, next))
 	}
 
 	b.WriteString("\n")
@@ -835,54 +1147,29 @@ func buildFallbackConferenciaText(req models.ConferenciaRequest, empresaCfg conf
 	if strings.TrimSpace(req.Operador) != "" || strings.TrimSpace(req.CX) != "" {
 		operador := sanitizeOneLineASCII(req.Operador)
 		cx := sanitizeOneLineASCII(req.CX)
-		if cx == "" {
-			b.WriteString("Operador: " + operador)
-			b.WriteString("\n")
-		} else {
-			b.WriteString(leftRightASCII("Operador: "+operador, "CX: "+cx, cols))
-			b.WriteString("\n")
-		}
+		b.WriteString(operadorLinha(operador, cx, cols))
+		b.WriteString("\n")
 	}
 	b.WriteString(printedAt.Format("02/01/2006 15:04:05"))
 	b.WriteString("\n")
 	b.WriteString(centerASCII("www.goopedir.com.br", cols))
 	b.WriteString("\n")
-	b.WriteString(strings.Repeat("-", cols))
+	appendFallbackConferenciaMensagem(&b, conferenciaCfg, cols)
+	b.WriteString(conferenciaDelimiterLine(conferenciaCfg, cols))
 	b.WriteString("\n")
 
 	return b.String()
 }
 
 func buildFallbackSangriaText(req models.SangriaRequest, empresaCfg config.EmpresaParametros, printedAt time.Time, cols int) string {
-	empresa := sanitizeOneLineASCII(empresaCfg.Nome)
-	if empresa == "" {
-		empresa = sanitizeOneLineASCII(empresaCfg.Razao)
-	}
-	cnpj := "CNPJ: " + sanitizeOneLineASCII(empresaCfg.CNPJ)
-	fantasia := sanitizeOneLineASCII(empresaCfg.Razao)
-	endereco := sanitizeOneLineASCII(fmt.Sprintf("%s, %s, %s/%s - CEP %s", empresaCfg.Rua, empresaCfg.Bairro, empresaCfg.Cidade, empresaCfg.Estado, empresaCfg.CEP))
-	ie := "IE: " + sanitizeOneLineASCII(string(empresaCfg.IE))
+	headerLines := empresaHeaderLines(empresaCfg)
 
 	var b strings.Builder
-	for _, l := range wrapTextASCII(empresa, cols) {
-		b.WriteString(centerASCII(l, cols))
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(cnpj, cols) {
-		b.WriteString(centerASCII(l, cols))
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(fantasia, cols) {
-		b.WriteString(centerASCII(l, cols))
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(endereco, cols) {
-		b.WriteString(centerASCII(l, cols))
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(ie, cols) {
-		b.WriteString(centerASCII(l, cols))
-		b.WriteString("\n")
+	for _, line := range headerLines {
+		for _, l := range wrapTextASCII(line, cols) {
+			b.WriteString(centerASCII(l, cols))
+			b.WriteString("\n")
+		}
 	}
 
 	b.WriteString("\n")
@@ -902,13 +1189,8 @@ func buildFallbackSangriaText(req models.SangriaRequest, empresaCfg config.Empre
 	operador := sanitizeOneLineASCII(req.Operador)
 	cx := sanitizeOneLineASCII(req.CX)
 	if operador != "" || cx != "" {
-		if cx == "" {
-			b.WriteString("Operador: " + operador)
-			b.WriteString("\n")
-		} else {
-			b.WriteString(leftRightASCII("Operador: "+operador, "CX: "+cx, cols))
-			b.WriteString("\n")
-		}
+		b.WriteString(operadorLinha(operador, cx, cols))
+		b.WriteString("\n")
 	}
 	b.WriteString(printedAt.Format("02/01/2006 15:04:05"))
 	b.WriteString("\n\n\n")
@@ -1054,10 +1336,10 @@ func buildFallbackCaixaFechamentoText(req models.CaixaFechamentoRequest, empresa
 		b.WriteString("\n")
 		b.WriteString(caixaNameQtyMoneyHeader("NOME", cols))
 		b.WriteString("\n")
-		totalCatQty := 0
+		totalCatQty := 0.0
 		totalCatVal := 0.0
 		for _, it := range cats {
-			q := it.Quantidade
+			q := float64(it.Quantidade)
 			v := float64(it.TotalGeral)
 			totalCatQty += q
 			totalCatVal += v
@@ -1078,10 +1360,10 @@ func buildFallbackCaixaFechamentoText(req models.CaixaFechamentoRequest, empresa
 		b.WriteString("\n")
 		b.WriteString(caixaNameQtyMoneyHeader("NOME", cols))
 		b.WriteString("\n")
-		totalProdQty := 0
+		totalProdQty := 0.0
 		totalProdVal := 0.0
 		for _, it := range prods {
-			q := it.Quantidade
+			q := float64(it.Quantidade)
 			v := float64(it.Total)
 			totalProdQty += q
 			totalProdVal += v
@@ -1155,9 +1437,8 @@ func buildFallbackCaixaFechamentoText(req models.CaixaFechamentoRequest, empresa
 	return b.String()
 }
 
-func buildEscPOSConferencia(req models.ConferenciaRequest, empresaCfg config.EmpresaParametros, printedAt time.Time, hasMargins bool, margins config.PrinterMargins, maxWidthDots int, maxCols int) []byte {
+func buildEscPOSConferencia(req models.ConferenciaRequest, empresaCfg config.EmpresaParametros, printedAt time.Time, hasMargins bool, margins config.PrinterMargins, maxWidthDots int, maxCols int, cols int, conferenciaCfg config.ConferenciaConfig) []byte {
 	const dotsPerMM = 8
-	const dotsPerCol = 12
 
 	leftDots := 8
 	widthDots := maxWidthDots - leftDots
@@ -1167,24 +1448,16 @@ func buildEscPOSConferencia(req models.ConferenciaRequest, empresaCfg config.Emp
 		topLines = mmToLines(margins.TopoMM)
 		bottomLines = mmToLines(margins.BaseMM)
 	}
-	cols := widthDots / dotsPerCol
-	if cols < 20 {
-		cols = 20
-	}
-	if cols > maxCols {
-		cols = maxCols
-	}
-	cols -= 6
-	if cols < 20 {
-		cols = 20
+	if cols <= 0 {
+		cols = conferenciaCols(maxWidthDots, maxCols)
 	}
 
+	fontStyle := conferenciaFont(conferenciaCfg)
 	buf := make([]byte, 0, 1024)
 	buf = append(buf, 0x1B, 0x40)
-	buf = append(buf, 0x1B, 0x4D, 0x00)
-	buf = append(buf, 0x1D, 0x21, 0x00)
 	buf = append(buf, 0x1B, 0x32)
 	buf = append(buf, 0x1B, 0x74, 0x02)
+	appendConferenciaFont(&buf, fontStyle)
 
 	buf = append(buf, 0x1D, 0x4C, byte(leftDots%256), byte(leftDots/256))
 	buf = append(buf, 0x1D, 0x57, byte(widthDots%256), byte(widthDots/256))
@@ -1192,52 +1465,31 @@ func buildEscPOSConferencia(req models.ConferenciaRequest, empresaCfg config.Emp
 		buf = append(buf, 0x1B, 0x64, byte(minInt(topLines, 255)))
 	}
 
-	empresa := sanitizeOneLineASCII(empresaCfg.Nome)
-	if empresa == "" {
-		empresa = sanitizeOneLineASCII(empresaCfg.Razao)
-	}
-	cnpj := "CNPJ: " + sanitizeOneLineASCII(empresaCfg.CNPJ)
-	fantasia := sanitizeOneLineASCII(empresaCfg.Razao)
-	endereco := sanitizeOneLineASCII(fmt.Sprintf("%s, %s, %s/%s - CEP %s", empresaCfg.Rua, empresaCfg.Bairro, empresaCfg.Cidade, empresaCfg.Estado, empresaCfg.CEP))
-	ie := "IE: " + sanitizeOneLineASCII(string(empresaCfg.IE))
+	headerLines := empresaHeaderLines(empresaCfg)
 	mesa := strings.ToUpper(sanitizeOneLineASCII(req.Mesa))
 
 	buf = append(buf, 0x1B, 0x61, 0x01)
 	buf = append(buf, 0x1B, 0x45, 0x01)
-	for _, l := range wrapTextASCII(empresa, cols) {
-		buf = append(buf, encodeCP850(centerASCII(l, cols))...)
-		buf = append(buf, '\n')
+	for _, line := range headerLines {
+		for _, l := range wrapTextASCII(line, cols) {
+			buf = append(buf, encodeCP850(centerASCII(l, cols))...)
+			buf = append(buf, '\n')
+		}
 	}
 	buf = append(buf, 0x1B, 0x45, 0x00)
-	for _, l := range wrapTextASCII(cnpj, cols) {
-		buf = append(buf, encodeCP850(centerASCII(l, cols))...)
-		buf = append(buf, '\n')
-	}
-	for _, l := range wrapTextASCII(fantasia, cols) {
-		buf = append(buf, encodeCP850(centerASCII(l, cols))...)
-		buf = append(buf, '\n')
-	}
-	for _, l := range wrapTextASCII(endereco, cols) {
-		buf = append(buf, encodeCP850(centerASCII(l, cols))...)
-		buf = append(buf, '\n')
-	}
-	for _, l := range wrapTextASCII(ie, cols) {
-		buf = append(buf, encodeCP850(centerASCII(l, cols))...)
-		buf = append(buf, '\n')
-	}
 
 	buf = append(buf, '\n')
-	title := mesa
 	if isComandaConferencia(req) {
-		title = buildTipoSequencial(req)
+		appendEscPOSComandaHeader(&buf, req, cols)
+	} else {
+		buf = append(buf, 0x1B, 0x61, 0x00)
+		buf = append(buf, 0x1D, 0x42, 0x01)
+		buf = append(buf, 0x1B, 0x45, 0x01)
+		buf = append(buf, encodeCP850(padCenter(strings.ToUpper(mesa), cols))...)
+		buf = append(buf, 0x1B, 0x45, 0x00)
+		buf = append(buf, 0x1D, 0x42, 0x00)
+		buf = append(buf, '\n', '\n')
 	}
-	buf = append(buf, 0x1B, 0x61, 0x00)
-	buf = append(buf, 0x1D, 0x42, 0x01)
-	buf = append(buf, 0x1B, 0x45, 0x01)
-	buf = append(buf, encodeCP850(padCenter(strings.ToUpper(title), cols))...)
-	buf = append(buf, 0x1B, 0x45, 0x00)
-	buf = append(buf, 0x1D, 0x42, 0x00)
-	buf = append(buf, '\n', '\n')
 
 	buf = append(buf, 0x1B, 0x61, 0x00)
 
@@ -1258,18 +1510,22 @@ func buildEscPOSConferencia(req models.ConferenciaRequest, empresaCfg config.Emp
 	all = groupConferenciaProdutos(all)
 
 	lastProdCat := ""
-	for _, p := range all {
+	for i, p := range all {
 		prodCat := strings.ToUpper(strings.TrimSpace(sanitizeTextASCII(p.Categoria)))
 		if prodCat != "" && prodCat != lastProdCat {
 			buf = append(buf, 0x1B, 0x61, 0x01)
 			buf = append(buf, 0x1B, 0x45, 0x01)
-			buf = append(buf, encodeCP850(dottedCategoryLine(prodCat, cols))...)
+			buf = append(buf, encodeCP850(conferenciaCategoryLine(prodCat, cols, conferenciaCfg))...)
 			buf = append(buf, 0x1B, 0x45, 0x00)
 			buf = append(buf, '\n')
 			buf = append(buf, 0x1B, 0x61, 0x00)
 			lastProdCat = prodCat
 		}
-		buf = append(buf, encodeCP850(buildEscPOSProdutoLines(p, cols))...)
+		var next *models.Produto
+		if i+1 < len(all) {
+			next = &all[i+1]
+		}
+		appendEscPOSProdutoLines(&buf, p, cols, fontStyle, conferenciaCfg, shouldUseDelimiterInProdutoValue(p, next))
 	}
 
 	buf = append(buf, '\n')
@@ -1331,17 +1587,12 @@ func buildEscPOSConferencia(req models.ConferenciaRequest, empresaCfg config.Emp
 	if strings.TrimSpace(req.Operador) != "" || strings.TrimSpace(req.CX) != "" {
 		operador := sanitizeOneLineASCII(req.Operador)
 		cx := sanitizeOneLineASCII(req.CX)
-		if cx == "" {
-			buf = append(buf, encodeCP850("Operador: "+operador)...)
-			buf = append(buf, '\n')
-		} else {
-			buf = append(buf, encodeCP850(leftRightASCII("Operador: "+operador, "CX: "+cx, cols))...)
-			buf = append(buf, '\n')
-		}
+		buf = append(buf, encodeCP850(operadorLinha(operador, cx, cols))...)
+		buf = append(buf, '\n')
 	}
 
 	if isComandaConferencia(req) && len(req.Pagamentos) > 0 {
-		appendEscPOSPagamentos(&buf, req, cols)
+		appendEscPOSPagamentos(&buf, req, cols, isNarrowModelo(req.Modelo))
 	}
 
 	buf = append(buf, encodeCP850(conferenceDatetime(req, printedAt).Format("02/01/2006 15:04:05"))...)
@@ -1349,7 +1600,8 @@ func buildEscPOSConferencia(req models.ConferenciaRequest, empresaCfg config.Emp
 	buf = append(buf, 0x1B, 0x61, 0x01)
 	buf = append(buf, encodeCP850(centerASCII("www.goopedir.com.br", cols))...)
 	buf = append(buf, '\n')
-	buf = append(buf, encodeCP850(strings.Repeat("-", cols))...)
+	appendConferenciaMensagem(&buf, conferenciaCfg, cols)
+	buf = append(buf, encodeCP850(conferenciaDelimiterLine(conferenciaCfg, cols))...)
 	buf = append(buf, '\n')
 	buf = append(buf, 0x1B, 0x61, 0x00)
 
@@ -1451,13 +1703,8 @@ func buildEscPOSSangria(req models.SangriaRequest, empresaCfg config.EmpresaPara
 	operador := sanitizeOneLineASCII(req.Operador)
 	cx := sanitizeOneLineASCII(req.CX)
 	if operador != "" || cx != "" {
-		if cx == "" {
-			buf = append(buf, encodeCP850("Operador: "+operador)...)
-			buf = append(buf, '\n')
-		} else {
-			buf = append(buf, encodeCP850(leftRightASCII("Operador: "+operador, "CX: "+cx, cols))...)
-			buf = append(buf, '\n')
-		}
+		buf = append(buf, encodeCP850(operadorLinha(operador, cx, cols))...)
+		buf = append(buf, '\n')
 	}
 
 	buf = append(buf, encodeCP850(printedAt.Format("02/01/2006 15:04:05"))...)
@@ -1672,10 +1919,10 @@ func buildEscPOSCaixaFechamento(req models.CaixaFechamentoRequest, empresaCfg co
 		buf = append(buf, 0x1B, 0x61, 0x00)
 		buf = append(buf, encodeCP850(caixaNameQtyMoneyHeader("NOME", cols))...)
 		buf = append(buf, '\n')
-		totalCatQty := 0
+		totalCatQty := 0.0
 		totalCatVal := 0.0
 		for _, it := range cats {
-			q := it.Quantidade
+			q := float64(it.Quantidade)
 			v := float64(it.TotalGeral)
 			totalCatQty += q
 			totalCatVal += v
@@ -1700,10 +1947,10 @@ func buildEscPOSCaixaFechamento(req models.CaixaFechamentoRequest, empresaCfg co
 		buf = append(buf, 0x1B, 0x61, 0x00)
 		buf = append(buf, encodeCP850(caixaNameQtyMoneyHeader("NOME", cols))...)
 		buf = append(buf, '\n')
-		totalProdQty := 0
+		totalProdQty := 0.0
 		totalProdVal := 0.0
 		for _, it := range prods {
-			q := it.Quantidade
+			q := float64(it.Quantidade)
 			v := float64(it.Total)
 			totalProdQty += q
 			totalProdVal += v
@@ -1791,7 +2038,7 @@ func buildEscPOSCaixaFechamento(req models.CaixaFechamentoRequest, empresaCfg co
 	return buf
 }
 
-func buildEscPOSProdutoLines(p models.Produto, cols int) string {
+func buildEscPOSProdutoLines(p models.Produto, cols int, conferenciaCfg config.ConferenciaConfig, useDelimiter bool) string {
 	nome := sanitizeTextASCII(p.Nome)
 	var b strings.Builder
 	total := p.ValorTotal
@@ -1827,6 +2074,10 @@ func buildEscPOSProdutoLines(p models.Produto, cols int) string {
 
 	lastCat := ""
 	for _, e := range extras {
+		name := strings.TrimSpace(sanitizeTextASCII(e.Nome))
+		if name == "" {
+			continue
+		}
 		cat := sanitizeTextASCII(e.Categoria)
 		catUpper := strings.ToUpper(strings.TrimSpace(cat))
 		if catUpper != "" && catUpper != lastCat {
@@ -1835,7 +2086,6 @@ func buildEscPOSProdutoLines(p models.Produto, cols int) string {
 			lastCat = catUpper
 		}
 
-		name := sanitizeTextASCII(e.Nome)
 		line := name
 		if catUpper == "SABORES" && totalSabores > 0 {
 			line = fmt.Sprintf("%d/%d %s", e.Quantidade, totalSabores, line)
@@ -1856,13 +2106,93 @@ func buildEscPOSProdutoLines(p models.Produto, cols int) string {
 		}
 	}
 
-	b.WriteString(leftRightASCII("", fmtMoney(total), cols))
+	b.WriteString(conferenciaMoneyLineWithFill("", fmtMoney(total), cols, conferenciaCfg, useDelimiter))
 	b.WriteString("\n")
 	return b.String()
 }
 
-func writeFallbackProduto(b *strings.Builder, p models.Produto, cols int) {
-	b.WriteString(buildEscPOSProdutoLines(p, cols))
+func appendEscPOSProdutoLines(buf *[]byte, p models.Produto, cols int, fontStyle conferenciaFontStyle, conferenciaCfg config.ConferenciaConfig, useDelimiter bool) {
+	nome := sanitizeTextASCII(p.Nome)
+	total := p.ValorTotal
+	if total <= 0 {
+		total = (float64(p.Quantidade) * p.ValorUnitario) + p.ValorAdicional
+	}
+
+	appendConferenciaFont(buf, fontStyle)
+
+	titlePrefix := fmt.Sprintf("%dx - ", p.Quantidade)
+	first, rest := wrapFirstLine(nameToWords(nome), cols-len(titlePrefix))
+	*buf = append(*buf, encodeCP850(titlePrefix)...)
+	*buf = append(*buf, encodeCP850(first)...)
+	*buf = append(*buf, '\n')
+	for _, l := range wrapTextASCII(rest, cols-len(titlePrefix)) {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		*buf = append(*buf, encodeCP850(strings.Repeat(" ", len(titlePrefix)))...)
+		*buf = append(*buf, encodeCP850(l)...)
+		*buf = append(*buf, '\n')
+	}
+
+	totalSabores := 0
+	for _, e := range p.Extras {
+		if strings.EqualFold(strings.TrimSpace(sanitizeTextASCII(e.Categoria)), "SABORES") {
+			totalSabores += e.Quantidade
+		}
+	}
+
+	extras := make([]models.Extra, len(p.Extras))
+	copy(extras, p.Extras)
+	sort.SliceStable(extras, func(i, j int) bool {
+		return extraCategoryRankASCII(extras[i].Categoria) < extraCategoryRankASCII(extras[j].Categoria)
+	})
+
+	lastCat := ""
+	for _, e := range extras {
+		name := strings.TrimSpace(sanitizeTextASCII(e.Nome))
+		if name == "" {
+			continue
+		}
+		cat := sanitizeTextASCII(e.Categoria)
+		catUpper := strings.ToUpper(strings.TrimSpace(cat))
+		if catUpper != "" && catUpper != lastCat {
+			appendConferenciaFont(buf, fontStyle)
+			*buf = append(*buf, 0x1B, 0x45, 0x01)
+			*buf = append(*buf, encodeCP850(catUpper)...)
+			*buf = append(*buf, 0x1B, 0x45, 0x00)
+			appendConferenciaFont(buf, fontStyle)
+			*buf = append(*buf, '\n')
+			lastCat = catUpper
+		}
+
+		line := name
+		if catUpper == "SABORES" && totalSabores > 0 {
+			line = fmt.Sprintf("%d/%d %s", e.Quantidade, totalSabores, line)
+		} else if e.Quantidade > 1 {
+			line = fmt.Sprintf("%dUn %s", e.Quantidade, line)
+		}
+		for _, l := range wrapTextASCII("  - "+line, cols) {
+			appendConferenciaFont(buf, fontStyle)
+			*buf = append(*buf, encodeCP850(l)...)
+			appendConferenciaFont(buf, fontStyle)
+			*buf = append(*buf, '\n')
+		}
+	}
+
+	if strings.TrimSpace(p.Observacoes) != "" {
+		obs := sanitizeTextASCII(p.Observacoes)
+		for _, l := range wrapTextASCII("Obs: "+obs, cols) {
+			*buf = append(*buf, encodeCP850(l)...)
+			*buf = append(*buf, '\n')
+		}
+	}
+
+	*buf = append(*buf, encodeCP850(conferenciaMoneyLineWithFill("", fmtMoney(total), cols, conferenciaCfg, useDelimiter))...)
+	*buf = append(*buf, '\n')
+}
+
+func writeFallbackProduto(b *strings.Builder, p models.Produto, cols int, conferenciaCfg config.ConferenciaConfig, useDelimiter bool) {
+	b.WriteString(buildEscPOSProdutoLines(p, cols, conferenciaCfg, useDelimiter))
 }
 
 func flattenConferenciaProdutos(req models.ConferenciaRequest) []models.Produto {
@@ -1955,15 +2285,23 @@ func caixaNameQtyMoneyHeader(nameLabel string, cols int) string {
 	return padRightASCII(strings.ToUpper(nameLabel), nameW) + " " + padLeftASCII("QTD", qtyW) + " " + padLeftASCII("TOTAL", moneyW)
 }
 
-func caixaNameQtyMoneyLine(name string, qty int, money float64, cols int) string {
+func caixaNameQtyMoneyLine(name string, qty float64, money float64, cols int) string {
 	nameW, qtyW, moneyW := caixaTableWidths(cols)
 	n := sanitizeOneLineASCII(name)
 	if strings.TrimSpace(n) == "" {
 		n = "-"
 	}
-	q := fmt.Sprintf("%d", qty)
+	q := formatCaixaQuantidade(qty)
 	m := fmtAmountBR(money)
 	return padRightASCII(truncASCII(n, nameW), nameW) + " " + padLeftASCII(q, qtyW) + " " + padLeftASCII(m, moneyW)
+}
+
+func formatCaixaQuantidade(qty float64) string {
+	if math.Abs(qty-math.Round(qty)) < 0.000001 {
+		return fmt.Sprintf("%.0f", qty)
+	}
+	s := strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", qty), "0"), ".")
+	return strings.ReplaceAll(s, ".", ",")
 }
 
 func caixaTableWidths(cols int) (nameW int, qtyW int, moneyW int) {
@@ -2094,6 +2432,53 @@ func buildTipoSequencial(req models.ConferenciaRequest) string {
 	return fmt.Sprintf("%s %03d", t, req.Sequencial)
 }
 
+func buildComandaSequencial(req models.ConferenciaRequest) string {
+	if req.Sequencial <= 0 {
+		return "#000"
+	}
+	return fmt.Sprintf("#%03d", req.Sequencial)
+}
+
+func buildComandaTipo(req models.ConferenciaRequest) string {
+	t := strings.ToLower(strings.TrimSpace(sanitizeOneLineASCII(req.Tipo)))
+	switch t {
+	case "vem busca", "vem buscar", "retirada", "retirar", "retira":
+		return "Vem Buscar"
+	case "delivery", "entrega":
+		return "Delivery"
+	case "mesa":
+		return "Mesa"
+	}
+	if t == "" {
+		return strings.TrimSpace(sanitizeOneLineASCII(req.Mesa))
+	}
+	parts := strings.Fields(t)
+	for i := range parts {
+		if len(parts[i]) == 0 {
+			continue
+		}
+		parts[i] = strings.ToUpper(parts[i][:1]) + parts[i][1:]
+	}
+	return strings.Join(parts, " ")
+}
+
+func appendEscPOSComandaHeader(buf *[]byte, req models.ConferenciaRequest, cols int) {
+	seq := buildComandaSequencial(req)
+	tipo := buildComandaTipo(req)
+
+	*buf = append(*buf, 0x1B, 0x61, 0x01)
+	*buf = append(*buf, 0x1B, 0x45, 0x01)
+	*buf = append(*buf, encodeCP850(centerASCII(seq, cols))...)
+	*buf = append(*buf, '\n')
+	if strings.TrimSpace(tipo) != "" {
+		*buf = append(*buf, encodeCP850(centerASCII(tipo, cols))...)
+		*buf = append(*buf, '\n')
+	}
+	*buf = append(*buf, 0x1B, 0x45, 0x00)
+	*buf = append(*buf, 0x1B, 0x61, 0x00)
+	*buf = append(*buf, '\n')
+}
+
 func onlyDigits(s string) string {
 	var b strings.Builder
 	for _, r := range s {
@@ -2130,7 +2515,23 @@ func pedidosTexto(n int) string {
 	if n == 1 {
 		return "Primeiro Pedido"
 	}
-	return fmt.Sprintf("%d Pedidos No Restaurante", n)
+	return fmt.Sprintf("%d Pedidos no restaurante", n)
+}
+
+func fidelidadeTexto(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d pontos de fidelidade", n)
+}
+
+func operadorLinha(operador string, cx string, cols int) string {
+	operador = sanitizeOneLineASCII(operador)
+	cx = sanitizeOneLineASCII(cx)
+	if cx != "" {
+		return leftRightASCII("Operador: "+operador, "CX: "+cx, cols)
+	}
+	return leftRightASCII("Operador:", operador, cols)
 }
 
 func buildEnderecoConferencia(e models.ConferenciaEndereco) string {
@@ -2176,11 +2577,15 @@ func appendEscPOSComandaInfo(buf *[]byte, req models.ConferenciaRequest, printed
 		*buf = append(*buf, '\n')
 	}
 
-	// Para DELIVERY/RETIRADA (quando "Tipo" vem preenchido), exibimos apenas o contador numérico,
-	// sem os textos "Primeiro Pedido" / "X Pedidos ...".
-	if strings.TrimSpace(req.Tipo) != "" && req.Cliente.Pedidos > 0 {
-		*buf = append(*buf, encodeCP850(fmt.Sprintf("Pedidos: %d", int(req.Cliente.Pedidos)))...)
+	if strings.TrimSpace(req.Tipo) != "" {
+		*buf = append(*buf, encodeCP850(pedidosTexto(int(req.Cliente.Pedidos)))...)
 		*buf = append(*buf, '\n')
+		if fidelidade := fidelidadeTexto(int(req.Cliente.Fidelidade)); fidelidade != "" {
+			*buf = append(*buf, 0x1B, 0x45, 0x01)
+			*buf = append(*buf, encodeCP850(fidelidade)...)
+			*buf = append(*buf, 0x1B, 0x45, 0x00)
+			*buf = append(*buf, '\n')
+		}
 	}
 
 	end := buildEnderecoConferencia(req.Endereco)
@@ -2194,7 +2599,7 @@ func appendEscPOSComandaInfo(buf *[]byte, req models.ConferenciaRequest, printed
 	*buf = append(*buf, '\n')
 }
 
-func appendEscPOSPagamentos(buf *[]byte, req models.ConferenciaRequest, cols int) {
+func appendEscPOSPagamentos(buf *[]byte, req models.ConferenciaRequest, cols int, centerDesc bool) {
 	*buf = append(*buf, 0x1B, 0x61, 0x01)
 	*buf = append(*buf, 0x1B, 0x45, 0x01)
 	*buf = append(*buf, encodeCP850(centerASCII("PAGAMENTO", cols))...)
@@ -2211,13 +2616,28 @@ func appendEscPOSPagamentos(buf *[]byte, req models.ConferenciaRequest, cols int
 		}
 
 		right := ""
-		if p.Troco > 0 {
-			right = "Troco " + fmtMoney(p.Troco)
+		troco := p.Troco
+		if troco < 0 {
+			troco = troco * -1
+		}
+		if troco > 0 {
+			right = "Troco " + fmtMoney(troco)
 		} else if p.Valor > 0 {
 			right = fmtMoney(p.Valor)
 		}
-		*buf = append(*buf, encodeCP850(leftRightASCII(desc, right, cols))...)
-		*buf = append(*buf, '\n')
+		if centerDesc {
+			*buf = append(*buf, 0x1B, 0x61, 0x01)
+			*buf = append(*buf, encodeCP850(centerASCII(desc, cols))...)
+			*buf = append(*buf, '\n')
+			if right != "" {
+				*buf = append(*buf, encodeCP850(centerASCII(right, cols))...)
+				*buf = append(*buf, '\n')
+			}
+			*buf = append(*buf, 0x1B, 0x61, 0x00)
+		} else {
+			*buf = append(*buf, encodeCP850(leftRightASCII(desc, right, cols))...)
+			*buf = append(*buf, '\n')
+		}
 
 		if strings.TrimSpace(p.Nome) != "" {
 			*buf = append(*buf, '\n', '\n')
@@ -2240,41 +2660,26 @@ func appendEscPOSPagamentos(buf *[]byte, req models.ConferenciaRequest, cols int
 	*buf = append(*buf, '\n')
 }
 
-func buildFallbackConferenciaComanda(req models.ConferenciaRequest, empresaCfg config.EmpresaParametros, printedAt time.Time, cols int) string {
-	empresa := sanitizeOneLineASCII(empresaCfg.Nome)
-	if empresa == "" {
-		empresa = sanitizeOneLineASCII(empresaCfg.Razao)
-	}
-	cnpj := "CNPJ: " + sanitizeOneLineASCII(empresaCfg.CNPJ)
-	fantasia := sanitizeOneLineASCII(empresaCfg.Razao)
-	endereco := sanitizeOneLineASCII(fmt.Sprintf("%s, %s, %s/%s - CEP %s", empresaCfg.Rua, empresaCfg.Bairro, empresaCfg.Cidade, empresaCfg.Estado, empresaCfg.CEP))
-	ie := "IE: " + sanitizeOneLineASCII(string(empresaCfg.IE))
-	title := buildTipoSequencial(req)
+func buildFallbackConferenciaComanda(req models.ConferenciaRequest, empresaCfg config.EmpresaParametros, printedAt time.Time, cols int, conferenciaCfg config.ConferenciaConfig) string {
+	headerLines := empresaHeaderLines(empresaCfg)
+	seq := buildComandaSequencial(req)
+	tipo := buildComandaTipo(req)
 
 	var b strings.Builder
-	for _, l := range wrapTextASCII(empresa, cols) {
-		b.WriteString(centerASCII(l, cols))
-		b.WriteString("\n")
+	for _, line := range headerLines {
+		for _, l := range wrapTextASCII(line, cols) {
+			b.WriteString(centerASCII(l, cols))
+			b.WriteString("\n")
+		}
 	}
-	for _, l := range wrapTextASCII(cnpj, cols) {
-		b.WriteString(centerASCII(l, cols))
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(fantasia, cols) {
-		b.WriteString(centerASCII(l, cols))
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(endereco, cols) {
-		b.WriteString(centerASCII(l, cols))
-		b.WriteString("\n")
-	}
-	for _, l := range wrapTextASCII(ie, cols) {
-		b.WriteString(centerASCII(l, cols))
+	b.WriteString("\n")
+	b.WriteString(centerASCII(seq, cols))
+	b.WriteString("\n")
+	if strings.TrimSpace(tipo) != "" {
+		b.WriteString(centerASCII(tipo, cols))
 		b.WriteString("\n")
 	}
 	b.WriteString("\n")
-	b.WriteString(centerASCII(title, cols))
-	b.WriteString("\n\n")
 
 	data := conferenceDatetime(req, printedAt).Format("02/01/2006 15:04")
 	b.WriteString("Data: " + data + "\n")
@@ -2286,10 +2691,13 @@ func buildFallbackConferenciaComanda(req models.ConferenciaRequest, empresaCfg c
 	if strings.TrimSpace(cel) != "" {
 		b.WriteString("Celular: " + cel + "\n")
 	}
-	// Para DELIVERY/RETIRADA (quando "Tipo" vem preenchido), exibimos apenas o contador numérico,
-	// sem os textos "Primeiro Pedido" / "X Pedidos ...".
-	if strings.TrimSpace(req.Tipo) != "" && req.Cliente.Pedidos > 0 {
-		b.WriteString(fmt.Sprintf("Pedidos: %d\n", int(req.Cliente.Pedidos)))
+	if strings.TrimSpace(req.Tipo) != "" {
+		b.WriteString(pedidosTexto(int(req.Cliente.Pedidos)))
+		b.WriteString("\n")
+		if fidelidade := fidelidadeTexto(int(req.Cliente.Fidelidade)); fidelidade != "" {
+			b.WriteString(fidelidade)
+			b.WriteString("\n")
+		}
 	}
 	end := buildEnderecoConferencia(req.Endereco)
 	if strings.TrimSpace(end) != "" {
@@ -2306,14 +2714,18 @@ func buildFallbackConferenciaComanda(req models.ConferenciaRequest, empresaCfg c
 	})
 	all = groupConferenciaProdutos(all)
 	lastProdCat := ""
-	for _, p := range all {
+	for i, p := range all {
 		prodCat := strings.ToUpper(strings.TrimSpace(sanitizeTextASCII(p.Categoria)))
 		if prodCat != "" && prodCat != lastProdCat {
-			b.WriteString(dottedCategoryLine(prodCat, cols))
+			b.WriteString(conferenciaCategoryLine(prodCat, cols, conferenciaCfg))
 			b.WriteString("\n")
 			lastProdCat = prodCat
 		}
-		writeFallbackProduto(&b, p, cols)
+		var next *models.Produto
+		if i+1 < len(all) {
+			next = &all[i+1]
+		}
+		writeFallbackProduto(&b, p, cols, conferenciaCfg, shouldUseDelimiterInProdutoValue(p, next))
 	}
 
 	b.WriteString("\n")
@@ -2372,31 +2784,40 @@ func buildFallbackConferenciaComanda(req models.ConferenciaRequest, empresaCfg c
 	operador := sanitizeOneLineASCII(req.Operador)
 	cx := sanitizeOneLineASCII(req.CX)
 	if operador != "" || cx != "" {
-		if cx == "" {
-			b.WriteString("Operador: " + operador)
-			b.WriteString("\n")
-		} else {
-			b.WriteString(leftRightASCII("Operador: "+operador, "CX: "+cx, cols))
-			b.WriteString("\n")
-		}
+		b.WriteString(operadorLinha(operador, cx, cols))
+		b.WriteString("\n")
 	}
 
 	if len(req.Pagamentos) > 0 {
 		b.WriteString(centerASCII("PAGAMENTO", cols))
 		b.WriteString("\n")
+		centerDesc := isNarrowModelo(req.Modelo)
 		for _, p := range req.Pagamentos {
 			desc := sanitizeOneLineASCII(p.Descricao)
 			if desc == "" {
 				continue
 			}
 			right := ""
-			if p.Troco > 0 {
-				right = "Troco " + fmtMoney(p.Troco)
+			troco := p.Troco
+			if troco < 0 {
+				troco = troco * -1
+			}
+			if troco > 0 {
+				right = "Troco " + fmtMoney(troco)
 			} else if p.Valor > 0 {
 				right = fmtMoney(p.Valor)
 			}
-			b.WriteString(leftRightASCII(desc, right, cols))
-			b.WriteString("\n")
+			if centerDesc {
+				b.WriteString(centerASCII(desc, cols))
+				b.WriteString("\n")
+				if right != "" {
+					b.WriteString(centerASCII(right, cols))
+					b.WriteString("\n")
+				}
+			} else {
+				b.WriteString(leftRightASCII(desc, right, cols))
+				b.WriteString("\n")
+			}
 			if strings.TrimSpace(p.Nome) != "" {
 				n := clienteNome
 				if n == "" {
@@ -2425,7 +2846,8 @@ func buildFallbackConferenciaComanda(req models.ConferenciaRequest, empresaCfg c
 	b.WriteString("\n")
 	b.WriteString(centerASCII("www.goopedir.com.br", cols))
 	b.WriteString("\n")
-	b.WriteString(strings.Repeat("-", cols))
+	appendFallbackConferenciaMensagem(&b, conferenciaCfg, cols)
+	b.WriteString(conferenciaDelimiterLine(conferenciaCfg, cols))
 	b.WriteString("\n")
 	return b.String()
 }
@@ -2441,6 +2863,22 @@ func conferenceDatetime(req models.ConferenciaRequest, fallback time.Time) time.
 		t = t.Add(d)
 	}
 	return t
+}
+
+func isNarrowModelo(modelo string) bool {
+	modelo = strings.ToLower(strings.TrimSpace(modelo))
+	return modelo == "56mm" || modelo == "58mm"
+}
+
+func reportFallbackCols(modelo string, maxCols int) int {
+	if !isNarrowModelo(modelo) {
+		return maxCols
+	}
+	fallbackCols := maxCols - 6
+	if fallbackCols < 20 {
+		fallbackCols = 20
+	}
+	return fallbackCols
 }
 
 func qtyPrefixASCII(qty int, indented bool) string {

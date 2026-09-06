@@ -34,6 +34,7 @@ Recebe o payload, valida, formata a comanda e retorna um `job_id` + `preview_url
   "numero": 0,
   "usuario": "Carlos",
   "driver": "COZINHA (Windows)",
+  "modelo": "80mm",
   "impressora": "Bar (ERP)",
   "imprimir_agora": false,
   "produtos": [
@@ -59,6 +60,7 @@ $body = @'
   "numero": 0,
   "usuario": "Carlos",
   "driver": "COZINHA (Windows)",
+  "modelo": "80mm",
   "impressora": "Bar (ERP)",
   "imprimir_agora": false,
   "produtos": [
@@ -104,6 +106,8 @@ Consulta o status do job (`pendente`, `imprimindo`, `impresso`, `erro`).
 ## Mensagens de erro
 
 O serviço retorna mensagens claras em português (ex.: impressora não encontrada, impressora offline, JSON inválido, validação de campos).
+
+Para `POST /impressao/cozinha`, o campo `modelo` agora pode ser enviado como `56mm`, `58mm` ou `80mm`. Quando omitido, o serviço mantém o comportamento atual e assume largura de `80mm`.
 
 ## Layout (80mm)
 

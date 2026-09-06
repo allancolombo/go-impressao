@@ -126,6 +126,40 @@ func TestFormatComandaCozinha_Wrap80mm(t *testing.T) {
 	}
 }
 
+func TestFormatComandaCozinha_Wrap56mm(t *testing.T) {
+	f := NewFormatter()
+	when := time.Date(2026, 5, 4, 10, 11, 12, 0, time.Local)
+
+	req := models.ImpressaoCozinhaRequest{
+		Tipo:       "mesa",
+		Numero:     7,
+		Usuario:    "Allan",
+		Driver:     "COZINHA (Windows)",
+		Modelo:     "56mm",
+		Impressora: "Bar (ERP)",
+		Produtos: []models.Produto{
+			{
+				Nome:       "Hambúrguer artesanal com queijo, bacon e cebola caramelizada",
+				Quantidade: 1,
+				Extras: []models.Extra{
+					{Nome: "Molho especial da casa com pimenta e alho", Quantidade: 1},
+				},
+				Observacoes: "Entregar no balcão do fundo, por favor",
+			},
+		},
+	}
+
+	got := f.FormatComandaCozinhaWithCols(req, when, 32)
+	for _, line := range strings.Split(strings.ReplaceAll(got, "\r\n", "\n"), "\n") {
+		if len(line) == 0 {
+			continue
+		}
+		if utf8.RuneCountInString(line) > 32 {
+			t.Fatalf("linha excedeu 32 colunas: %q (%d)", line, utf8.RuneCountInString(line))
+		}
+	}
+}
+
 func TestFormatComandaCozinha_Categorias(t *testing.T) {
 	f := NewFormatter()
 	when := time.Date(2026, 5, 4, 10, 11, 12, 0, time.Local)

@@ -23,10 +23,22 @@ type PrintService struct {
 	cfg       *config.Manager
 }
 
+func kitchenCols(cfg *config.Manager, printerName string, modelo string) int {
+	if cfg != nil {
+		return cfg.EffectiveColsByModelo(printerName, modelo)
+	}
+
+	modelo = strings.ToLower(strings.TrimSpace(modelo))
+	if modelo == "56mm" || modelo == "58mm" {
+		return 32
+	}
+	return 48
+}
+
 func NewPrintService(logger *log.Logger, jobStore *JobStore, formatter *Formatter, printer printer.Printer, history *HistoryStore, cfg *config.Manager) *PrintService {
 	return &PrintService{
 		logger:    logger,
-		jobStore: jobStore,
+		jobStore:  jobStore,
 		formatter: formatter,
 		printer:   printer,
 		history:   history,
@@ -58,16 +70,13 @@ func (s *PrintService) StartPrint(jobID string) error {
 
 	go func() {
 		printedAt := time.Now()
-		cols := 48
-		if s.cfg != nil {
-			cols = s.cfg.EffectiveCols(payload.Driver)
-		}
+		cols := kitchenCols(s.cfg, payload.Driver, payload.Modelo)
 		text := s.formatter.FormatComandaCozinhaWithCols(payload, printedAt, cols)
 
 		ctx, cancel := printer.DefaultPrintContext()
 		defer cancel()
 
-		err := s.printer.PrintText(ctx, payload.Driver, text)
+		err := s.printer.PrintText(ctx, payload.Driver, text, payload.QRCod, payload.Modelo)
 		if err != nil {
 			s.logger.Printf("job=%s erro ao imprimir: %v", jobID, err)
 			_ = s.jobStore.Update(jobID, func(j *Job) {
@@ -129,14 +138,11 @@ func (s *PrintService) PrintNow(ctx context.Context, jobID string) error {
 	payload := job.Payload
 
 	printedAt := time.Now()
-	cols := 48
-	if s.cfg != nil {
-		cols = s.cfg.EffectiveCols(payload.Driver)
-	}
+	cols := kitchenCols(s.cfg, payload.Driver, payload.Modelo)
 	text := s.formatter.FormatComandaCozinhaWithCols(payload, printedAt, cols)
 
 	s.logger.Printf("job=%s impressão síncrona impressora_erp=%q impressora_windows=%q", jobID, job.Payload.Impressora, job.Payload.Driver)
-	if err := s.printer.PrintText(ctx, payload.Driver, text); err != nil {
+	if err := s.printer.PrintText(ctx, payload.Driver, text, payload.QRCod, payload.Modelo); err != nil {
 		if s.history != nil {
 			_ = s.history.Add(HistoryRecord{
 				ID:                "job-" + jobID + "-" + strconv.FormatInt(printedAt.UnixNano(), 10),

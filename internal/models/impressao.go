@@ -22,9 +22,11 @@ type ImpressaoCozinhaRequest struct {
 	Tipo          TipoImpressao `json:"tipo"`
 	Numero        int           `json:"numero"`
 	UUID          string        `json:"uuid,omitempty"`
+	QRCod         string        `json:"qrcod,omitempty"`
 	Cliente       string        `json:"cliente,omitempty"`
 	Usuario       string        `json:"usuario"`
 	Driver        string        `json:"driver"`
+	Modelo        string        `json:"modelo,omitempty"` // opcional; "56mm" | "58mm" | "80mm"
 	Impressora    string        `json:"impressora"`
 	ImprimirAgora bool          `json:"imprimir_agora"`
 	Produtos      []Produto     `json:"produtos"`
@@ -134,7 +136,7 @@ type CaixaSangriaItem struct {
 type CaixaProdutoItem struct {
 	ID          int       `json:"id,omitempty"`
 	Produto     string    `json:"produto"`
-	Quantidade  int       `json:"quantidade"`
+	Quantidade  FlexFloat `json:"quantidade"`
 	Total       FlexFloat `json:"total"`
 	TotalGeral  FlexFloat `json:"totalGeral,omitempty"`
 	TotalAdicional FlexFloat `json:"totalAdicional,omitempty"`
@@ -143,7 +145,7 @@ type CaixaProdutoItem struct {
 type CaixaCategoriaItem struct {
 	ID            int       `json:"id,omitempty"`
 	Produto       string    `json:"produto"`
-	Quantidade    int       `json:"quantidade"`
+	Quantidade    FlexFloat `json:"quantidade"`
 	TotalGeral    FlexFloat `json:"totalGeral"`
 	Total         FlexFloat `json:"total,omitempty"`
 	TotalAdicional FlexFloat `json:"totalAdicional,omitempty"`
@@ -167,6 +169,7 @@ type ConferenciaCliente struct {
 	CPF     string                 `json:"cpf,omitempty"`
 	Celular string                 `json:"celular"`
 	Pedidos FlexInt                `json:"pedidos"`
+	Fidelidade FlexInt             `json:"fidelidade,omitempty"`
 }
 
 type ConferenciaEndereco struct {
@@ -301,10 +304,12 @@ func (r *CaixaFechamentoRequest) UnmarshalJSON(b []byte) error {
 func (r *ImpressaoCozinhaRequest) Normalize() {
 	r.Usuario = strings.TrimSpace(r.Usuario)
 	r.Driver = strings.TrimSpace(r.Driver)
+	r.Modelo = strings.TrimSpace(strings.ToLower(r.Modelo))
 	r.Impressora = strings.TrimSpace(r.Impressora)
 	r.Tipo = TipoImpressao(strings.TrimSpace(string(r.Tipo)))
 	r.UUID = strings.ToLower(strings.TrimSpace(r.UUID))
 	r.Cliente = strings.TrimSpace(r.Cliente)
+	r.QRCod = strings.TrimSpace(r.QRCod)
 
 	for i := range r.Produtos {
 		r.Produtos[i].UUID = strings.ToLower(strings.TrimSpace(r.Produtos[i].UUID))
@@ -336,6 +341,9 @@ func (r ImpressaoCozinhaRequest) Validate() error {
 	}
 	if r.Driver == "" {
 		errs = append(errs, `campo "driver" é obrigatório`)
+	}
+	if r.Modelo != "" && r.Modelo != "56mm" && r.Modelo != "58mm" && r.Modelo != "80mm" {
+		errs = append(errs, `campo "modelo" deve ser "56mm", "58mm" ou "80mm"`)
 	}
 	if r.Impressora == "" {
 		errs = append(errs, `campo "impressora" é obrigatório`)
@@ -393,6 +401,9 @@ func (r *ConferenciaRequest) Normalize() {
 	for i := range r.Pagamentos {
 		r.Pagamentos[i].Descricao = strings.TrimSpace(r.Pagamentos[i].Descricao)
 		r.Pagamentos[i].Nome = strings.TrimSpace(r.Pagamentos[i].Nome)
+		if r.Pagamentos[i].Troco < 0 {
+			r.Pagamentos[i].Troco = r.Pagamentos[i].Troco * -1
+		}
 	}
 
 	for i := range r.Itens {
@@ -400,9 +411,18 @@ func (r *ConferenciaRequest) Normalize() {
 			r.Itens[i].Produtos[j].Categoria = strings.TrimSpace(r.Itens[i].Produtos[j].Categoria)
 			r.Itens[i].Produtos[j].Nome = strings.TrimSpace(r.Itens[i].Produtos[j].Nome)
 			r.Itens[i].Produtos[j].Observacoes = strings.TrimSpace(r.Itens[i].Produtos[j].Observacoes)
-			for k := range r.Itens[i].Produtos[j].Extras {
-				r.Itens[i].Produtos[j].Extras[k].Categoria = strings.TrimSpace(r.Itens[i].Produtos[j].Extras[k].Categoria)
-				r.Itens[i].Produtos[j].Extras[k].Nome = strings.TrimSpace(r.Itens[i].Produtos[j].Extras[k].Nome)
+			extras := r.Itens[i].Produtos[j].Extras
+			if len(extras) > 0 {
+				kept := make([]Extra, 0, len(extras))
+				for _, e := range extras {
+					e.Categoria = strings.TrimSpace(e.Categoria)
+					e.Nome = strings.TrimSpace(e.Nome)
+					if e.Nome == "" {
+						continue
+					}
+					kept = append(kept, e)
+				}
+				r.Itens[i].Produtos[j].Extras = kept
 			}
 		}
 	}
@@ -476,7 +496,7 @@ func (r ConferenciaRequest) Validate() error {
 			}
 			for k, e := range p.Extras {
 				if strings.TrimSpace(e.Nome) == "" {
-					errs = append(errs, fmt.Sprintf(`itens[%d].produtos[%d].extras[%d].nome é obrigatório`, i, j, k))
+					continue
 				}
 				if e.Quantidade <= 0 {
 					errs = append(errs, fmt.Sprintf(`itens[%d].produtos[%d].extras[%d].quantidade deve ser maior que zero`, i, j, k))
@@ -494,8 +514,8 @@ func (r ConferenciaRequest) Validate() error {
 		if strings.TrimSpace(p.Descricao) == "" {
 			errs = append(errs, fmt.Sprintf(`pagamentos[%d].descricao é obrigatório`, i))
 		}
-		if p.Valor < 0 || p.Troco < 0 {
-			errs = append(errs, fmt.Sprintf(`pagamentos[%d] valores devem ser maiores ou iguais a zero`, i))
+		if p.Valor < 0 {
+			errs = append(errs, fmt.Sprintf(`pagamentos[%d].valor deve ser maior ou igual a zero`, i))
 		}
 	}
 
