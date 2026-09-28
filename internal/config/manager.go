@@ -16,12 +16,18 @@ import (
 	"unicode/utf8"
 )
 
+type Tenant struct {
+	TenantID string `json:"tenantId"`
+	Nome     string `json:"nome"`
+}
+
 type Manager struct {
 	logger *log.Logger
 	path   string
 
 	mu          sync.RWMutex
 	baseURL     string
+	tenantID    string
 	printers    map[string]PrinterConfig
 	logo        LogoConfig
 	conferencia ConferenciaConfig
@@ -31,6 +37,7 @@ type Manager struct {
 
 type fileConfig struct {
 	BaseURL     string                   `json:"base_url"`
+	TenantID    string                   `json:"tenant_id,omitempty"`
 	Printers    map[string]PrinterConfig `json:"printers,omitempty"`
 	Logo        LogoConfig               `json:"logo,omitempty"`
 	Conferencia ConferenciaConfig        `json:"conferencia,omitempty"`
@@ -123,7 +130,7 @@ func (m *Manager) Init(ctx context.Context) {
 	defer cancel()
 
 	m.logger.Printf("config: nenhuma URL configurada. tentando automaticamente: %s", auto)
-	if err := TestBaseURL(testCtx, auto); err != nil {
+	if err := m.TestBaseURL(testCtx, auto); err != nil {
 		m.logger.Printf("config: tentativa automática falhou: %v", err)
 		return
 	}
@@ -155,6 +162,7 @@ func (m *Manager) RefreshEmpresaParametros(ctx context.Context) (EmpresaParametr
 	if err != nil {
 		return EmpresaParametros{}, false
 	}
+	m.ApplyTenantHeader(req)
 	resp, err := (&http.Client{Timeout: 3 * time.Second}).Do(req)
 	if err != nil {
 		return EmpresaParametros{}, false
@@ -252,6 +260,94 @@ func (m *Manager) GetBaseURL() (string, bool) {
 		return "", false
 	}
 	return m.baseURL, true
+}
+
+func (m *Manager) GetTenantID() (string, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if strings.TrimSpace(m.tenantID) == "" {
+		return "", false
+	}
+	return m.tenantID, true
+}
+
+func (m *Manager) SetTenantID(tenantID string) error {
+	tenantID = strings.TrimSpace(tenantID)
+	m.mu.Lock()
+	m.tenantID = tenantID
+	m.mu.Unlock()
+	return m.save()
+}
+
+func (m *Manager) ApplyTenantHeader(req *http.Request) {
+	if req == nil {
+		return
+	}
+	m.mu.RLock()
+	tid := strings.TrimSpace(m.tenantID)
+	m.mu.RUnlock()
+	if tid != "" {
+		req.Header.Set("tenant-id", tid)
+	}
+}
+
+func (m *Manager) FetchTenants(ctx context.Context) ([]Tenant, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	baseURL, ok := m.GetBaseURL()
+	if !ok || strings.TrimSpace(baseURL) == "" {
+		return nil, fmt.Errorf("configure a URL principal antes de carregar os tenants")
+	}
+
+	target := strings.TrimRight(baseURL, "/") + "/tenant"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("tenant-id", "find")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("endpoint /tenant retornou status %d", resp.StatusCode)
+	}
+
+	var raw any
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, fmt.Errorf("resposta inválida ao carregar tenants")
+	}
+
+	arr, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("resposta de /tenant não é um array")
+	}
+
+	out := make([]Tenant, 0, len(arr))
+	for _, item := range arr {
+		b, err := json.Marshal(item)
+		if err != nil {
+			continue
+		}
+		var t Tenant
+		if err := json.Unmarshal(b, &t); err != nil {
+			continue
+		}
+		t.TenantID = strings.TrimSpace(t.TenantID)
+		t.Nome = strings.TrimSpace(t.Nome)
+		if t.TenantID == "" {
+			continue
+		}
+		out = append(out, t)
+	}
+	return out, nil
 }
 
 func (m *Manager) GetPrinterConfig(printerName string) (PrinterConfig, bool) {
@@ -594,10 +690,35 @@ func (m *Manager) ValidateAndSave(ctx context.Context, baseURL string) error {
 	if err := ValidateBaseURLFormat(baseURL); err != nil {
 		return err
 	}
-	if err := TestBaseURL(ctx, baseURL); err != nil {
+	if err := m.TestBaseURL(ctx, baseURL); err != nil {
 		return err
 	}
 	return m.setAndSave(baseURL)
+}
+
+func (m *Manager) TestBaseURL(ctx context.Context, baseURL string) error {
+	if err := ValidateBaseURLFormat(baseURL); err != nil {
+		return err
+	}
+
+	target := strings.TrimRight(baseURL, "/") + "/impressao/padrao"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return fmt.Errorf("erro ao criar requisição de teste: %w", err)
+	}
+	m.ApplyTenantHeader(req)
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("falha de rede ao testar %s: %v", target, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("endpoint /impressao/padrao retornou status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func (m *Manager) setAndSave(baseURL string) error {
@@ -679,6 +800,7 @@ func (m *Manager) load() error {
 			m.baseURL = cfg.BaseURL
 		}
 	}
+	m.tenantID = strings.TrimSpace(cfg.TenantID)
 	m.printers = cfg.Printers
 	m.logo = cfg.Logo
 	m.conferencia = normalizeConferenciaConfig(cfg.Conferencia)
@@ -701,6 +823,7 @@ func (m *Manager) save() error {
 	m.mu.RLock()
 	cfg := fileConfig{
 		BaseURL:     m.baseURL,
+		TenantID:    m.tenantID,
 		Printers:    m.printers,
 		Logo:        m.logo,
 		Conferencia: normalizeConferenciaConfig(m.conferencia),

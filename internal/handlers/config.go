@@ -37,6 +37,8 @@ func (h *ConfigHandler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/config/printer/margins", h.handleSavePrinterMargins)
 	mux.HandleFunc("/config/printer/cols", h.handleSavePrinterCols)
 	mux.HandleFunc("/config/logo", h.handleLogo)
+	mux.HandleFunc("/config/tenants", h.handleTenants)
+	mux.HandleFunc("/config/tenant/select", h.handleTenantSelect)
 }
 
 func (h *ConfigHandler) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -62,13 +64,109 @@ func (h *ConfigHandler) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	baseURL, _ := h.cfg.GetBaseURL()
+	tenantID, _ := h.cfg.GetTenantID()
 	resp := map[string]any{
 		"base_url":    baseURL,
+		"tenant_id":   tenantID,
 		"printers":    h.cfg.GetAllPrinters(),
 		"logo":        h.cfg.GetLogo(),
 		"conferencia": h.cfg.GetConferenciaConfig(),
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *ConfigHandler) handleTenants(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "método não permitido")
+		return
+	}
+
+	list, err := h.cfg.FetchTenants(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"erro":  err.Error(),
+			"items": []any{},
+		})
+		return
+	}
+
+	currentTenantID, _ := h.cfg.GetTenantID()
+	autoSelected := false
+	if len(list) == 1 && currentTenantID == "" {
+		_ = h.cfg.SetTenantID(list[0].TenantID)
+		currentTenantID = list[0].TenantID
+		autoSelected = true
+	}
+
+	items := make([]map[string]any, 0, len(list))
+	for _, t := range list {
+		items = append(items, map[string]any{
+			"tenant_id": t.TenantID,
+			"nome":      t.Nome,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":            true,
+		"items":         items,
+		"tenant_id":     currentTenantID,
+		"count":         len(items),
+		"auto_selected": autoSelected,
+	})
+}
+
+func (h *ConfigHandler) handleTenantSelect(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSONError(w, http.StatusMethodNotAllowed, "método não permitido")
+		return
+	}
+
+	body, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "não foi possível ler o corpo da requisição")
+		return
+	}
+	defer r.Body.Close()
+
+	var req struct {
+		TenantID string `json:"tenant_id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "JSON inválido: verifique a sintaxe")
+		return
+	}
+
+	req.TenantID = strings.TrimSpace(req.TenantID)
+	if req.TenantID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":   false,
+			"erro": "tenant_id é obrigatório",
+		})
+		return
+	}
+
+	if err := h.cfg.SetTenantID(req.TenantID); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":   false,
+			"erro": err.Error(),
+		})
+		return
+	}
+
+	tenantID, _ := h.cfg.GetTenantID()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"tenant_id": tenantID,
+	})
 }
 
 func (h *ConfigHandler) handleTest(w http.ResponseWriter, r *http.Request) {
@@ -91,7 +189,7 @@ func (h *ConfigHandler) handleTest(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 
-	if err := config.TestBaseURL(ctx, req.BaseURL); err != nil {
+	if err := h.cfg.TestBaseURL(ctx, req.BaseURL); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
 			"ok":   false,
 			"erro": err.Error(),
@@ -457,6 +555,7 @@ func (h *ConfigHandler) fetchPrinterDrivers(ctx context.Context) ([]printerDrive
 	if err != nil {
 		return nil, err
 	}
+	h.cfg.ApplyTenantHeader(req)
 
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
@@ -560,6 +659,27 @@ func renderConfigHTML(baseURL string) string {
   </div>
 
   <div class="card">
+    <h2 style="margin:0 0 8px 0; font-size:16px">Empresa / Tenant</h2>
+    <div class="row">
+      <div id="tenantStatus" class="muted">Nenhuma empresa carregada.</div>
+    </div>
+    <div id="tenantListWrap" style="display:none">
+      <div class="row">
+        <label style="width:100%">
+          Selecione a empresa:
+          <select id="tenantSelect">
+            <option value="">Selecione...</option>
+          </select>
+        </label>
+      </div>
+      <div class="row">
+        <button id="btnRefreshTenants" type="button">Atualizar lista</button>
+        <div id="msgTenants" class=""></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
     <h2 style="margin:0 0 8px 0; font-size:16px">Configuração por impressora</h2>
     <div class="grid4">
       <label style="grid-column: span 2">Impressora (Windows)
@@ -630,14 +750,17 @@ func renderConfigHTML(baseURL string) string {
 <script>
 let currentPrinters = {};
 let currentDrivers = [];
+let currentTenants = [];
+let currentTenantId = "";
 
 function normalizeStaticTexts() {
   document.title = "Configuração";
   const h1 = document.querySelector("h1");
   if (h1) h1.textContent = "Configuração";
   const cards = document.querySelectorAll(".card h2");
-  if (cards[1]) cards[1].textContent = "Configuração por impressora";
-  if (cards[2]) cards[2].textContent = "Conferência";
+  if (cards[1]) cards[1].textContent = "Empresa / Tenant";
+  if (cards[2]) cards[2].textContent = "Configuração por impressora";
+  if (cards[3]) cards[3].textContent = "Conferência";
   const cDelimitador = document.getElementById("cDelimitador");
   if (cDelimitador) cDelimitador.maxLength = 1;
   const cMensagem = document.getElementById("cMensagem");
@@ -667,6 +790,86 @@ function setMsgEl(id, text, kind) {
   const el = document.getElementById(id);
   el.className = kind || "";
   el.textContent = text || "";
+}
+
+function setTenantStatus(text, kind) {
+  const el = document.getElementById("tenantStatus");
+  if (!el) return;
+  el.className = kind || "";
+  if (!text) {
+    text = "Nenhuma empresa carregada.";
+    el.className = "muted";
+  }
+  el.textContent = text;
+}
+
+function renderTenantSelect() {
+  const wrap = document.getElementById("tenantListWrap");
+  const sel = document.getElementById("tenantSelect");
+  if (!wrap || !sel) return;
+  sel.innerHTML = '<option value="">Selecione...</option>';
+  const items = currentTenants || [];
+  items.forEach(t => {
+    const opt = document.createElement("option");
+    opt.value = t.tenant_id || "";
+    opt.textContent = t.nome || t.tenant_id || "Sem nome";
+    if (t.tenant_id && t.tenant_id === currentTenantId) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  if (items.length === 0) {
+    wrap.style.display = "none";
+  } else {
+    wrap.style.display = "";
+  }
+  if (currentTenantId) {
+    const selT = items.find(t => t.tenant_id === currentTenantId);
+    if (selT) {
+      setTenantStatus("Atual: " + (selT.nome || selT.tenant_id), "ok");
+    } else {
+      setTenantStatus("Selecionado (ID): " + currentTenantId, "ok");
+    }
+  } else if (items.length === 0) {
+    setTenantStatus("", "muted");
+  } else {
+    setTenantStatus("Selecione uma empresa.", "err");
+  }
+}
+
+async function loadTenants() {
+  setMsgEl("msgTenants", "Carregando...", "");
+  const res = await fetch("/config/tenants").catch(() => null);
+  const data = (res && await res.json().catch(() => ({}))) || {};
+  if (!res || !res.ok) {
+    currentTenants = [];
+    currentTenantId = "";
+    renderTenantSelect();
+    setMsgEl("msgTenants", data.erro || "Não foi possível carregar as empresas.", "err");
+    return;
+  }
+  currentTenants = (data.items || []).map(it => ({
+    tenant_id: it.tenant_id || "",
+    nome: it.nome || "",
+  }));
+  currentTenantId = data.tenant_id || "";
+  renderTenantSelect();
+  if (data.auto_selected) {
+    setMsgEl("msgTenants", "1 empresa encontrada e selecionada automaticamente.", "ok");
+  } else {
+    setMsgEl("msgTenants", data.count + " empresa(s) carregada(s).", "ok");
+  }
+}
+
+async function selectTenant(tenantId) {
+  if (!tenantId) return;
+  setMsgEl("msgTenants", "Selecionando...", "");
+  try {
+    const data = await postJson("/config/tenant/select", { tenant_id: tenantId });
+    currentTenantId = data.tenant_id || tenantId;
+    renderTenantSelect();
+    setMsgEl("msgTenants", "Empresa selecionada com sucesso.", "ok");
+  } catch (e) {
+    setMsgEl("msgTenants", "Erro: " + e.message, "err");
+  }
 }
 
 function uniqSorted(values) {
@@ -749,6 +952,7 @@ async function loadSettings() {
   const tbl = document.getElementById("tblPrinterConfig");
   tbl.innerHTML = "";
   currentPrinters = data.printers || {};
+  currentTenantId = data.tenant_id || "";
 
   Object.keys(currentPrinters).sort().forEach(name => {
     const cfg = currentPrinters[name] || {};
@@ -782,6 +986,7 @@ async function loadSettings() {
   document.getElementById("cMensagem").value = conferencia.mensagem_final || "";
 
   await loadDrivers();
+  await loadTenants();
 }
 
 document.getElementById("btnTestar").addEventListener("click", async () => {
@@ -801,6 +1006,7 @@ document.getElementById("btnSalvar").addEventListener("click", async () => {
   try {
     const data = await postJson("/config/save", { base_url: baseUrl });
     setMsg("Salvo com sucesso: " + (data.base_url || baseUrl), "ok");
+    await loadTenants();
   } catch (e) {
     setMsg("Erro: " + e.message, "err");
   }
@@ -808,6 +1014,16 @@ document.getElementById("btnSalvar").addEventListener("click", async () => {
 
 document.getElementById("pPrinter").addEventListener("change", syncPrinterForm);
 document.getElementById("pModelo").addEventListener("change", syncPrinterForm);
+
+document.getElementById("btnRefreshTenants").addEventListener("click", async () => {
+  await loadTenants();
+});
+
+document.getElementById("tenantSelect").addEventListener("change", (e) => {
+  const val = (e.target.value || "").trim();
+  if (!val) return;
+  selectTenant(val);
+});
 
 document.getElementById("btnSalvarPrinterConfig").addEventListener("click", async () => {
   setMsgEl("msgPrinterConfig", "Salvando...", "");

@@ -121,7 +121,7 @@ func main() {
 
 	if hasBaseURL && appURL != "" {
 		go func() {
-			notifyConfigGO(logger, baseURL, appURL)
+			notifyConfigGO(logger, cfgManager, baseURL, appURL)
 			ticker := time.NewTicker(30 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -129,7 +129,10 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					notifyConfigGO(logger, baseURL, appURL)
+					currentBaseURL, ok := cfgManager.GetBaseURL()
+					if ok {
+						notifyConfigGO(logger, cfgManager, currentBaseURL, appURL)
+					}
 				}
 			}
 		}()
@@ -307,7 +310,7 @@ func itoa(n int) string {
 	return string(buf[i:])
 }
 
-func notifyConfigGO(logger *log.Logger, baseURL string, appURL string) {
+func notifyConfigGO(logger *log.Logger, cfgManager *config.Manager, baseURL string, appURL string) {
 	target := strings.TrimRight(strings.TrimSpace(baseURL), "/") + "/impressao/config/go"
 	appURL = strings.TrimSpace(appURL)
 	if target == "/impressao/config/go" || appURL == "" {
@@ -330,6 +333,9 @@ func notifyConfigGO(logger *log.Logger, baseURL string, appURL string) {
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json; charset=utf-8")
+		if cfgManager != nil {
+			cfgManager.ApplyTenantHeader(req)
+		}
 
 		logger.Printf("config-go: tentativa=%d POST %s body.url=%s", attempt, target, appURL)
 		resp, err := (&http.Client{Timeout: 8 * time.Second}).Do(req)
