@@ -1152,6 +1152,7 @@ func buildFallbackConferenciaText(req models.ConferenciaRequest, empresaCfg conf
 	}
 	b.WriteString(printedAt.Format("02/01/2006 15:04:05"))
 	b.WriteString("\n")
+	writeFallbackCupom(&b, req.Cupom, cols)
 	b.WriteString(centerASCII("www.goopedir.com.br", cols))
 	b.WriteString("\n")
 	appendFallbackConferenciaMensagem(&b, conferenciaCfg, cols)
@@ -1597,6 +1598,7 @@ func buildEscPOSConferencia(req models.ConferenciaRequest, empresaCfg config.Emp
 
 	buf = append(buf, encodeCP850(conferenceDatetime(req, printedAt).Format("02/01/2006 15:04:05"))...)
 	buf = append(buf, '\n')
+	appendEscPOSCupom(&buf, req.Cupom, cols, fontStyle)
 	buf = append(buf, 0x1B, 0x61, 0x01)
 	buf = append(buf, encodeCP850(centerASCII("www.goopedir.com.br", cols))...)
 	buf = append(buf, '\n')
@@ -2844,6 +2846,7 @@ func buildFallbackConferenciaComanda(req models.ConferenciaRequest, empresaCfg c
 
 	b.WriteString(conferenceDatetime(req, printedAt).Format("02/01/2006 15:04:05"))
 	b.WriteString("\n")
+	writeFallbackCupom(&b, req.Cupom, cols)
 	b.WriteString(centerASCII("www.goopedir.com.br", cols))
 	b.WriteString("\n")
 	appendFallbackConferenciaMensagem(&b, conferenciaCfg, cols)

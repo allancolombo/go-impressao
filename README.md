@@ -109,6 +109,34 @@ O serviço retorna mensagens claras em português (ex.: impressora não encontra
 
 Para `POST /impressao/cozinha`, o campo `modelo` agora pode ser enviado como `56mm`, `58mm` ou `80mm`. Quando omitido, o serviço mantém o comportamento atual e assume largura de `80mm`.
 
+## Cupom na conferência (POST /impressao/conferencia)
+
+O payload da conferência aceita o objeto opcional `cupom`. Ele é impresso no fim da comanda, depois da data/hora, dentro de uma área tracejada. Só é impresso quando `codigo` vem preenchido.
+
+```json
+"cupom": {
+  "titulo": "10% OFF NA ENTREGA",
+  "descricao": "no seu próximo pedido",
+  "codigo": "UUCG",
+  "site": "hamburgueria.goopedir.com",
+  "qrcode": "https://hamburgueria.goopedir.com/cupom/UUCG",
+  "validade": "2026-11-30",
+  "mensagem": "Volte sempre, Carlos!"
+}
+```
+
+| Campo | Obrigatório | Impressão |
+|---|---|---|
+| `titulo` | não | Negrito, altura dupla, em maiúsculas |
+| `descricao` | não | Negrito, logo abaixo do título |
+| `codigo` | **sim** | "Use o codigo no site[ `site`]:" e o código em negrito, tamanho duplo |
+| `site` | não | Entra na frase acima do código |
+| `qrcode` | não | "Aponte a camera para o QR Code:" + QR Code com o link |
+| `validade` | não | "Oferta valida no seu proximo pedido / ate DD/MM/AAAA" (aceita `dd/mm/aaaa` ou `aaaa-mm-dd`) |
+| `mensagem` | não | Mensagem personalizada em negrito, no fim do cupom (aceita `\n`) |
+
+A linha "Confira as regras no site." é sempre impressa. Na pré-visualização em texto, o QR Code aparece como o link.
+
 ## Layout (80mm)
 
 - Cabeçalho (tipo + número): tarja (reverse), negrito e preenchida até 48 colunas.

@@ -78,6 +78,23 @@ type ConferenciaRequest struct {
 	NFCEChave          string                 `json:"nfceChave,omitempty"`
 	NFCEProtocolo      string                 `json:"nfceProtocolo,omitempty"`
 	NFCENumero         string                 `json:"nfceNumero,omitempty"`
+	Cupom              *ConferenciaCupom      `json:"cupom,omitempty"`
+}
+
+// ConferenciaCupom é o cupom de desconto impresso no fim da conferência.
+// Só é impresso quando "codigo" vem preenchido.
+type ConferenciaCupom struct {
+	Titulo    string `json:"titulo"`              // ex.: "10% OFF NA ENTREGA"
+	Descricao string `json:"descricao,omitempty"` // ex.: "no seu proximo pedido"
+	Codigo    string `json:"codigo"`
+	Site      string `json:"site,omitempty"`
+	QRCode    string `json:"qrcode,omitempty"` // link codificado no QR Code
+	Validade  string `json:"validade,omitempty"` // "dd/mm/aaaa" ou "aaaa-mm-dd"
+	Mensagem  string `json:"mensagem,omitempty"` // mensagem personalizada do cliente
+}
+
+func (c *ConferenciaCupom) Ativo() bool {
+	return c != nil && strings.TrimSpace(c.Codigo) != ""
 }
 
 type SangriaRequest struct {
@@ -389,6 +406,15 @@ func (r *ConferenciaRequest) Normalize() {
 	r.NFCEChave = strings.TrimSpace(r.NFCEChave)
 	r.NFCEProtocolo = strings.TrimSpace(r.NFCEProtocolo)
 	r.NFCENumero = strings.TrimSpace(r.NFCENumero)
+	if r.Cupom != nil {
+		r.Cupom.Titulo = strings.TrimSpace(r.Cupom.Titulo)
+		r.Cupom.Descricao = strings.TrimSpace(r.Cupom.Descricao)
+		r.Cupom.Codigo = strings.TrimSpace(r.Cupom.Codigo)
+		r.Cupom.Site = strings.TrimSpace(r.Cupom.Site)
+		r.Cupom.QRCode = strings.TrimSpace(r.Cupom.QRCode)
+		r.Cupom.Validade = strings.TrimSpace(r.Cupom.Validade)
+		r.Cupom.Mensagem = strings.TrimSpace(r.Cupom.Mensagem)
+	}
 
 	r.Cliente.Nome = strings.TrimSpace(r.Cliente.Nome)
 	r.Cliente.CPF = strings.TrimSpace(r.Cliente.CPF)
